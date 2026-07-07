@@ -86,6 +86,12 @@ export function useSessionStateCache({
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId
+    // Clear view immediately on switch so old session messages don't bleed
+    // into the new session during the async load window (#3769).
+    if (activeSessionId) {
+      viewSessionIdRef.current = null
+      setMessages([])
+    }
   }, [activeSessionId])
 
   useEffect(() => {

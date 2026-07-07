@@ -100,6 +100,7 @@ import type { SidebarNavItem } from '../../types'
 
 import { countLabel } from './chrome'
 import { SidebarCronJobsSection } from './cron-jobs-section'
+import { SessionCategoriesSection } from './session-categories-section'
 import { SidebarLoadMoreRow } from './load-more-row'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { ProfileRail } from './profile-switcher'
@@ -1173,6 +1174,18 @@ export function ChatSidebar({
                 sessions={pinnedSessions}
                 sortable={pinnedSessions.length > 1}
                 workingSessionIdSet={workingSessionIdSet}
+              />
+            )}
+
+            {!trimmedQuery && (
+              <SessionCategoriesSection
+                activeSessionId={activeSidebarSessionId}
+                sessionById={sessionByAnyId}
+                workingSessionIdSet={workingSessionIdSet}
+                onArchiveSession={onArchiveSession}
+                onBranchSession={onBranchSession}
+                onDeleteSession={onDeleteSession}
+                onResumeSession={onResumeSession}
               />
             )}
 
