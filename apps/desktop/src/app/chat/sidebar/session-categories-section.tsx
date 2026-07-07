@@ -169,7 +169,7 @@ function CategorySection({
         >
           <SidebarSessionsSection
             activeSessionId={activeSessionId}
-            contentClassName="flex flex-col gap-px"
+            contentClassName="flex flex-col gap-px pb-0.5"
             emptyState={
               <div className="grid min-h-8 place-items-center rounded-lg px-2 text-center text-[0.625rem] text-(--ui-text-tertiary) italic">
                 Drop sessions here
@@ -189,6 +189,7 @@ function CategorySection({
             }}
             open={!cat.collapsed}
             pinned={false}
+            rootClassName="p-0 pb-0.5"
             sessions={catSessions}
             sortable={false}
             workingSessionIdSet={workingSessionIdSet}
