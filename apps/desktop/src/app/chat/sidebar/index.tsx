@@ -1196,12 +1196,8 @@ export function ChatSidebar({
                 collapsible={!inProject}
                 contentClassName={cn(
                   'flex min-h-0 flex-1 flex-col pb-1.75',
-                  SCROLL_Y,
-                  // Separate profile sections clearly in the ALL view; rows inside
-                  // each group keep their own tight gap-px rhythm.
+                  recentsVirtualizes && SCROLL_Y,
                   showAllProfiles ? 'gap-3' : 'gap-px',
-                  // Flatten into the single scroll when compact — unless this is the
-                  // virtualized long list, which must keep its own scroller.
                   !recentsVirtualizes && COMPACT_FLAT
                 )}
                 dndSensors={dndSensors}
@@ -1335,7 +1331,8 @@ export function ChatSidebar({
                 projectsLoading={worktreeGroupingActive ? projectTreeLoading : false}
                 removedSessionIds={inProject ? removedSessionIds : undefined}
                 rootClassName={cn(
-                  'min-h-32 flex-1 overflow-hidden p-0',
+                  'min-h-32 p-0',
+                  recentsVirtualizes && 'flex-1 overflow-hidden',
                   !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
                 )}
                 sessions={displayAgentSessions}
