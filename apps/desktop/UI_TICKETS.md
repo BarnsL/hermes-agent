@@ -48,10 +48,11 @@
 **File:** `%APPDATA%/Greenshot/Greenshot.ini`
 
 ## TKT-010 — Session bleed on rapid switch
-**Status:** ✅ Fixed
-**Root cause:** Warm cache resume didn't clear messages before `setActiveSessionId`.
-**Fix:** Moved `setMessages([])` before `takeWarmCache()` — always clears on resume.
-**File:** `src/app/session/hooks/use-session-actions/index.ts`
+**Status:** ✅ Fixed (revised)
+**Root cause:** Warm cache resume didn't clear old messages before repainting, causing 1-frame bleed.
+**Fix v1 (reverted):** Moved `setMessages([])` before `takeWarmCache()` — caused TKT-003 regression (forever-loading sessions on unstable backend).
+**Fix v2:** `use-session-state-cache.ts` effect clears old messages when `viewSessionIdRef` changes to a genuinely different ID. Resets `viewSessionIdRef` on null transitions so cold resume doesn't nuke prefetched transcript.
+**File:** `src/app/session/hooks/use-session-state-cache.ts`
 
 ## TKT-011 — Reliable Hermes restart
 **Status:** ✅ Fixed & Verified (2026-07-08 02:11 UTC)
