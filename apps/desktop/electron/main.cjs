@@ -1,4 +1,5 @@
 const {
+  Tray,
   app,
   BrowserWindow,
   Menu,
@@ -773,6 +774,8 @@ function registerMediaProtocol() {
 
 let mainWindow = null
 let hermesProcess = null
+let tray = null
+let isQuitting = false
 let connectionPromise = null
 // Additional per-profile backends, keyed by profile name. The PRIMARY backend
 // (the desktop's launch profile) stays managed by hermesProcess +
@@ -3996,6 +3999,77 @@ function getAppIconPath() {
   return APP_ICON_PATHS.find(fileExists)
 }
 
+function createTray() {
+  if (IS_MAC) return
+  if (tray) return
+
+  const iconPath = getAppIconPath()
+  if (!iconPath) return
+
+  try {
+    const trayIcon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 })
+    tray = new Tray(trayIcon)
+
+    const contextMenu = Menu.buildFromTemplate([
+      {
+        label: 'Open Hermes',
+        click: () => {
+          if (mainWindow) {
+            if (mainWindow.isMinimized()) mainWindow.restore()
+            mainWindow.show()
+            mainWindow.focus()
+          } else {
+            createWindow()
+          }
+        }
+      },
+      {
+        label: 'Restart Hermes',
+        click: async () => {
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide()
+          try {
+            await teardownPrimaryBackendAndWait()
+            await new Promise(r => setTimeout(r, 1000))
+            await startHermes()
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.show()
+              mainWindow.webContents.reloadIgnoringCache()
+              mainWindow.focus()
+            } else {
+              createWindow()
+            }
+          } catch (err) {
+            rememberLog(`[tray] restart failed: ${err.message}`)
+            if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show()
+            else createWindow()
+          }
+        }
+      },
+      { type: 'separator' },
+      {
+        label: 'Quit Hermes',
+        click: () => {
+          isQuitting = true
+          if (tray) { tray.destroy(); tray = null }
+          app.quit()
+        }
+      }
+    ])
+
+    tray.setToolTip('Hermes')
+    tray.setContextMenu(contextMenu)
+    tray.on('double-click', () => {
+      if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore()
+        mainWindow.show()
+        mainWindow.focus()
+      }
+    })
+  } catch (err) {
+    rememberLog(`Tray creation failed: ${err.message}`)
+  }
+}
+
 function sendOpenUpdatesRequested() {
   if (!mainWindow || mainWindow.isDestroyed()) return
   const { webContents } = mainWindow
@@ -5202,6 +5276,7 @@ function stopBackendChild(child) {
 
 function resetHermesConnection() {
   connectionPromise = null
+  bootstrapFailure = null
   backendStartFailure = null
 
   stopBackendChild(hermesProcess)
@@ -6030,7 +6105,13 @@ function createWindow() {
   mainWindow.on('moved', schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
-  mainWindow.on('close', () => schedulePersistWindowState.flush())
+  mainWindow.on('close', (event) => {
+    schedulePersistWindowState.flush()
+    if (!IS_MAC && !isQuitting && tray) {
+      event.preventDefault()
+      mainWindow.hide()
+    }
+  })
 
   // The overlay rides the main window — closing the app's primary window must
   // tear it down too (otherwise it strands as an orphan that blocks
@@ -7621,6 +7702,7 @@ app.whenReady().then(() => {
   configureSpellChecker()
   registerPowerResumeListeners()
   createWindow()
+  createTray()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
@@ -7662,6 +7744,8 @@ function configureSpellChecker() {
 }
 
 app.on('before-quit', () => {
+  isQuitting = true
+  if (tray) { tray.destroy(); tray = null }
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
@@ -7693,11 +7777,6 @@ app.on('before-quit', () => {
 })
 
 app.on('window-all-closed', () => {
-  // macOS convention: keep the process alive in the Dock when the user closes
-  // the last window. But when we're handing off to a detached updater / swap /
-  // uninstall script, the process MUST exit so the script can replace or remove
-  // the bundle and relaunch — without this the script's PID-wait spins to its
-  // full timeout and the user is left with an invisible app (or an uninstall
-  // that appears to do nothing).
-  if (process.platform !== 'darwin' || isQuittingForHandoff) app.quit()
+  if (isQuittingForHandoff) { app.quit(); return }
+  if (process.platform !== 'darwin' && !tray) app.quit()
 })

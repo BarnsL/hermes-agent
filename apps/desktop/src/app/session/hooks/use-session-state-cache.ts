@@ -84,15 +84,35 @@ export function useSessionStateCache({
   // flush below tell a same-session refresh from a thread switch.
   const viewSessionIdRef = useRef<string | null>(null)
 
+  // When activeSessionId changes, prevent two classes of visual bug:
+  //
+  //  1. SESSION BLEED — old session content shows briefly while a new session
+  //     loads. Clear $messages when switching from a known view to a different
+  //     session, so the loader/empty state displays instead of stale content.
+  //
+  //  2. BLANK COLD RESUME — clearing on *every* non-null transition nukes the
+  //     just-prefetched transcript during a cold resume (null→value inside the
+  //     same resume flow). Guard by only clearing when replacing a known view
+  //     (viewSessionIdRef.current !== null).
+  //
+  //  Reset viewSessionIdRef on the null edge so the next resume's null→value
+  //  transition is recognised as a fresh load, not a cross-session switch.
+  //  Without this a cold resume would still trigger the clear because
+  //  viewSessionIdRef still points at the *previous* session's runtime id.
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId
-    // Clear view immediately on switch so old session messages don't bleed
-    // into the new session during the async load window (#3769).
     if (activeSessionId) {
+      if (
+        viewSessionIdRef.current !== null &&
+        viewSessionIdRef.current !== activeSessionId
+      ) {
+        viewSessionIdRef.current = null
+        setMessages([])
+      }
+    } else {
       viewSessionIdRef.current = null
-      setMessages([])
     }
-  }, [activeSessionId])
+  }, [activeSessionId, setMessages])
 
   useEffect(() => {
     setMutableRef(busyRef, busy)

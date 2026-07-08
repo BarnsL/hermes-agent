@@ -333,10 +333,15 @@ export function useSessionActions({
         return { runtimeId, state }
       }
 
+      // Always clear the transcript immediately on any resume — warm or cold.
+      // Without this, rapid session switches can show the previous session's
+      // content for a frame (the "session bleed"). The cold cache path below
+      // also needs this to clear stale content before the async load window.
+      setMessages([])
+
       if (!takeWarmCache()) {
         setActiveSessionId(null)
         activeSessionIdRef.current = null
-        setMessages([])
       }
 
       // Swap the single live gateway to this session's profile before any

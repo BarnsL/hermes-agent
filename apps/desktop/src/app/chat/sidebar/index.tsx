@@ -31,6 +31,7 @@ import {
   $dismissedAutoProjectIds,
   $panesFlipped,
   $pinnedSessionIds,
+  $sessionCategories,
   $sidebarAgentsGrouped,
   $sidebarCronOpen,
   $sidebarMessagingOpenIds,
@@ -100,7 +101,6 @@ import type { SidebarNavItem } from '../../types'
 
 import { countLabel } from './chrome'
 import { SidebarCronJobsSection } from './cron-jobs-section'
-import { SessionCategoriesSection } from './session-categories-section'
 import { SidebarLoadMoreRow } from './load-more-row'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { ProfileRail } from './profile-switcher'
@@ -121,6 +121,7 @@ import {
   useRepoWorktreeMap
 } from './projects'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
+import { SessionCategoriesSection } from './session-categories-section'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
@@ -156,7 +157,9 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
 const COMPACT_FLAT = 'compact:max-h-none compact:overflow-visible'
 
 // Vertical scroll only — never a horizontal bar from glow bleed, long titles, etc.
-const SCROLL_Y = 'overflow-y-auto overflow-x-hidden overscroll-contain'
+// overscroll-contain removed: causes scroll wheel to lock at bottom in Electron/Chromium
+// (wheel events consumed at boundary, requiring scroll-up to unstick).
+const SCROLL_Y = 'overflow-y-auto overflow-x-hidden'
 
 // A non-session group's scroll body: own scroller when tall, flattened when compact.
 const GROUP_BODY = cn(SCROLL_Y, COMPACT_FLAT)
@@ -244,6 +247,7 @@ export function ChatSidebar({
   const sessions = useStore($sessions)
   const cronSessions = useStore($cronSessions)
   const cronJobs = useStore($cronJobs)
+  const sessionCategories = useStore($sessionCategories)
   const messagingSessions = useStore($messagingSessions)
   const messagingPlatformTotals = useStore($messagingPlatformTotals)
   const messagingTruncated = useStore($messagingTruncated)
@@ -286,6 +290,7 @@ export function ChatSidebar({
   // Per-platform count of rows currently revealed (starts at NON_SESSION_INITIAL_ROWS).
   const [messagingVisible, setMessagingVisible] = useState<Record<string, number>>({})
   const searchInputRef = useRef<HTMLInputElement>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
   const trimmedQuery = searchQuery.trim()
 
   // Hotkey (session.focusSearch) → focus the field once it's mounted.
@@ -973,8 +978,21 @@ export function ChatSidebar({
     [agentProjectTree]
   )
 
+  // Virtualization creates its own scroll container which breaks unified
+  // scrolling when categories are present. Disable it whenever categories
+  // exist so all sections scroll together in the shared container.
   const recentsVirtualizes =
-    !displayAgentGroups?.length && !agentProjectTree?.length && displayAgentSessions.length >= VIRTUALIZE_THRESHOLD
+    sessionCategories.length === 0 &&
+    !displayAgentGroups?.length &&
+    !agentProjectTree?.length &&
+    displayAgentSessions.length >= VIRTUALIZE_THRESHOLD
+
+  // When Recents virtualizes inside the shared scroll container, give the
+  // virtualizer our outer scroll element so all sections scroll together.
+  const getScrollElement = useCallback(
+    () => scrollContainerRef.current,
+    []
+  )
 
   // Keep the persisted parent + worktree orders reconciled with what's on screen:
   // freshly-seen repos/worktrees surface at the top, vanished ones drop out of
@@ -1124,7 +1142,7 @@ export function ChatSidebar({
         )}
 
         {contentVisible && showSessionSections && (
-          <div className={cn('flex min-h-0 flex-1 flex-col pb-1.75', SCROLL_Y)}>
+          <div className={cn('flex min-h-0 flex-1 flex-col pb-1.75', SCROLL_Y)} ref={scrollContainerRef}>
             {trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
@@ -1180,12 +1198,12 @@ export function ChatSidebar({
             {!trimmedQuery && (
               <SessionCategoriesSection
                 activeSessionId={activeSidebarSessionId}
-                sessionById={sessionByAnyId}
-                workingSessionIdSet={workingSessionIdSet}
                 onArchiveSession={onArchiveSession}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
                 onResumeSession={onResumeSession}
+                sessionById={sessionByAnyId}
+                workingSessionIdSet={workingSessionIdSet}
               />
             )}
 
@@ -1195,10 +1213,8 @@ export function ChatSidebar({
                 activeSessionId={activeSidebarSessionId}
                 collapsible={!inProject}
                 contentClassName={cn(
-                  'flex min-h-0 flex-1 flex-col pb-1.75',
-                  recentsVirtualizes && SCROLL_Y,
-                  showAllProfiles ? 'gap-3' : 'gap-px',
-                  !recentsVirtualizes && COMPACT_FLAT
+                  'flex flex-col pb-1.75',
+                  showAllProfiles ? 'gap-3' : 'gap-px'
                 )}
                 dndSensors={dndSensors}
                 emptyState={
@@ -1226,6 +1242,7 @@ export function ChatSidebar({
                   ) : null
                 }
                 forceEmptyState={showSessionSkeletons}
+                getScrollElement={recentsVirtualizes ? getScrollElement : undefined}
                 groups={displayAgentGroups}
                 headerAction={
                   inProject && enteredProject ? (
@@ -1330,11 +1347,7 @@ export function ChatSidebar({
                 projectRepoWorktrees={inProject ? scopedRepoWorktrees : undefined}
                 projectsLoading={worktreeGroupingActive ? projectTreeLoading : false}
                 removedSessionIds={inProject ? removedSessionIds : undefined}
-                rootClassName={cn(
-                  'min-h-32 p-0',
-                  recentsVirtualizes && 'flex-1 overflow-hidden',
-                  !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
-                )}
+                rootClassName="min-h-32 p-0"
                 sessions={displayAgentSessions}
                 sortable={!showAllProfiles && agentSessions.length > 1}
                 workingSessionIdSet={workingSessionIdSet}
@@ -1343,7 +1356,9 @@ export function ChatSidebar({
 
             {!trimmedQuery &&
               !worktreeGroupingActive &&
-              messagingGroups.map(group => {
+              (messagingGroups.length > 0 || cronJobs.length > 0) && (
+                <div className="shrink-0 border-t border-(--ui-stroke-tertiary) pt-1.5">
+                  {messagingGroups.map(group => {
                 const visible = messagingVisible[group.sourceId] ?? NON_SESSION_INITIAL_ROWS
                 const shownSessions = group.sessions.slice(0, visible)
                 // More to show if rows are hidden behind the cap, or the backend
@@ -1398,6 +1413,8 @@ export function ChatSidebar({
                 onTriggerJob={onTriggerCronJob}
                 open={cronOpen}
               />
+            )}
+              </div>
             )}
           </div>
         )}

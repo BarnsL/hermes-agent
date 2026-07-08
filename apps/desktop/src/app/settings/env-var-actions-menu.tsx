@@ -127,7 +127,7 @@ export function EnvVarActionsTrigger({ className, label, ...props }: EnvVarActio
       variant="ghost"
       {...props}
     >
-      <Codicon name="ellipsis" size="0.875rem" />
+      <Codicon name="kebab-vertical" size="0.875rem" />
     </Button>
   )
 }

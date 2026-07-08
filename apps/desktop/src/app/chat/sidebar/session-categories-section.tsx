@@ -17,7 +17,6 @@ import {
   toggleCategoryCollapsed,
 } from '@/store/layout'
 import { pinSession } from '@/store/layout'
-import { $pinnedSessionIds } from '@/store/layout'
 
 import { CategoryDropZone } from './category-drop-zone'
 import { SidebarSessionsSection } from './sessions-section'
@@ -49,9 +48,9 @@ export function SessionCategoriesSection({
             Categories
           </span>
           <Button
-            variant="ghost" size="icon" className="h-5 w-5"
-            aria-label="New Category"
-            onClick={() => createCategory('New Category')}
+            aria-label="New Category" className="h-5 w-5" onClick={() => createCategory('New Category')}
+            size="icon"
+            variant="ghost"
           >
             <Codicon name="plus" size="0.75rem" />
           </Button>
@@ -69,9 +68,9 @@ export function SessionCategoriesSection({
             Categories
           </span>
           <Button
-            variant="ghost" size="icon" className="h-5 w-5"
-            aria-label="New Category"
-            onClick={() => createCategory('New Category')}
+            aria-label="New Category" className="h-5 w-5" onClick={() => createCategory('New Category')}
+            size="icon"
+            variant="ghost"
           >
             <Codicon name="plus" size="0.75rem" />
           </Button>
@@ -81,15 +80,15 @@ export function SessionCategoriesSection({
       {/* Individual categories */}
       {categories.map(cat => (
         <CategorySection
-          key={cat.id}
-          cat={cat}
-          sessionById={sessionById}
           activeSessionId={activeSessionId}
-          workingSessionIdSet={workingSessionIdSet}
+          cat={cat}
+          key={cat.id}
           onArchiveSession={onArchiveSession}
           onBranchSession={onBranchSession}
           onDeleteSession={onDeleteSession}
           onResumeSession={onResumeSession}
+          sessionById={sessionById}
+          workingSessionIdSet={workingSessionIdSet}
         />
       ))}
     </>
@@ -125,8 +124,8 @@ function CategorySection({
   const categoryMenu = (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" className="h-5 w-5 shrink-0 opacity-0 group-hover/section:opacity-100 focus-visible:opacity-100">
-          <Codicon name="ellipsis" size="0.875rem" />
+        <Button className="h-5 w-5 shrink-0 opacity-0 group-hover/section:opacity-100 focus-visible:opacity-100" size="icon" variant="ghost">
+          <Codicon name="kebab-vertical" size="0.875rem" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-36">
@@ -145,21 +144,22 @@ function CategorySection({
   )
 
   return (
-    <div className="min-h-0">
+    <div className="pb-2">
       {editingCat === cat.id ? (
         <div className="flex items-center gap-1 px-2 pb-1 pt-1.5">
           <Input
             autoFocus className="h-5 text-xs px-1 py-0 flex-1"
-            value={editCatName}
-            onChange={e => setEditCatName(e.target.value)}
             onBlur={() => {
-              if (editCatName.trim()) renameCategory(cat.id, editCatName.trim())
+              if (editCatName.trim()) {renameCategory(cat.id, editCatName.trim())}
               setEditingCat(null)
             }}
+            onChange={e => setEditCatName(e.target.value)}
             onKeyDown={e => {
               if (e.key === 'Enter') { renameCategory(cat.id, editCatName.trim()); setEditingCat(null) }
-              if (e.key === 'Escape') setEditingCat(null)
+
+              if (e.key === 'Escape') {setEditingCat(null)}
             }}
+            value={editCatName}
           />
         </div>
       ) : (
@@ -176,6 +176,7 @@ function CategorySection({
               </div>
             }
             headerAction={categoryMenu}
+            headerClassName="pb-0.5 pt-1"
             label={cat.name}
             labelMeta={<span className="tabular-nums">{catSessions.length}</span>}
             onArchiveSession={onArchiveSession}
