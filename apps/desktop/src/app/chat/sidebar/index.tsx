@@ -161,8 +161,10 @@ const COMPACT_FLAT = 'compact:max-h-none compact:overflow-visible'
 // (wheel events consumed at boundary, requiring scroll-up to unstick).
 const SCROLL_Y = 'overflow-y-auto overflow-x-hidden'
 
-// A non-session group's scroll body: own scroller when tall, flattened when compact.
-const GROUP_BODY = cn(SCROLL_Y, COMPACT_FLAT)
+// A non-session group's scroll body: capped at max-height, clipped (no own
+// scroll — the shared outer container handles all scrolling). overflow-hidden
+// prevents content from spilling out of the max-h cap.
+const GROUP_BODY = cn('overflow-hidden', COMPACT_FLAT)
 
 // Section-header action icons stay hidden until the whole header row is hovered
 // (group/section lives on SidebarSectionHeader), mirroring the artifacts/file
@@ -1166,7 +1168,7 @@ export function ChatSidebar({
                 onTogglePin={pinSession}
                 open
                 pinned={false}
-                rootClassName="min-h-32 flex-1 overflow-hidden p-0"
+                rootClassName="min-h-32 overflow-hidden p-0"
                 sessions={searchResults}
                 workingSessionIdSet={workingSessionIdSet}
               />
@@ -1347,7 +1349,7 @@ export function ChatSidebar({
                 projectRepoWorktrees={inProject ? scopedRepoWorktrees : undefined}
                 projectsLoading={worktreeGroupingActive ? projectTreeLoading : false}
                 removedSessionIds={inProject ? removedSessionIds : undefined}
-                rootClassName="min-h-32 flex-1 p-0"
+                rootClassName="min-h-32 p-0"
                 sessions={displayAgentSessions}
                 sortable={!showAllProfiles && agentSessions.length > 1}
                 workingSessionIdSet={workingSessionIdSet}
@@ -1357,7 +1359,7 @@ export function ChatSidebar({
             {!trimmedQuery &&
               !worktreeGroupingActive &&
               (messagingGroups.length > 0 || cronJobs.length > 0) && (
-                <div className="shrink-0 border-t border-(--ui-stroke-tertiary) pt-1.5">
+                <div className="shrink-0 border-t border-(--ui-stroke-tertiary) pt-1.5 mt-auto">
                   {messagingGroups.map(group => {
                     const visible = messagingVisible[group.sourceId] ?? NON_SESSION_INITIAL_ROWS
                     const shownSessions = group.sessions.slice(0, visible)

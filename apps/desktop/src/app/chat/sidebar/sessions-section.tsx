@@ -38,6 +38,7 @@ interface SidebarSectionHeaderProps {
   // toggle, no caret) and the section is always open. Used for the single-
   // project view, where collapsing one project makes no sense.
   collapsible?: boolean
+  className?: string
 }
 
 function SidebarSectionHeader({
@@ -47,7 +48,8 @@ function SidebarSectionHeader({
   action,
   meta,
   icon,
-  collapsible = true
+  collapsible = true,
+  className
 }: SidebarSectionHeaderProps) {
   const labelBody = (
     <>
@@ -58,7 +60,7 @@ function SidebarSectionHeader({
   )
 
   return (
-    <div className="group/section flex shrink-0 items-center justify-between gap-1 pb-1 pt-1.5">
+    <div className={cn('group/section flex shrink-0 items-center justify-between gap-1 pb-1 pt-1.5', className)}>
       {collapsible ? (
         <button
           className="group/section-label flex w-fit items-center gap-1 bg-transparent text-left leading-none"
@@ -127,6 +129,10 @@ interface SidebarSessionsSectionProps {
   // When false the section header is static (no caret/toggle) and always open.
   collapsible?: boolean
   sortable?: boolean
+  headerClassName?: string
+  /** When provided, passes a getScrollElement to the virtualized list so it
+   *  uses an external container for scrolling instead of owning its own. */
+  getScrollElement?: () => HTMLElement | null
   // The flat session list is the only hand-reorderable surface (grouped/project
   // views sort deterministically), so it owns the one ReorderableList.
   onReorderSessions?: (ids: string[]) => void
@@ -171,6 +177,8 @@ export function SidebarSessionsSection({
   labelIcon,
   collapsible = true,
   sortable = false,
+  headerClassName,
+  getScrollElement,
   onReorderSessions,
   onReorderProjects,
   projectBackRow,
@@ -305,6 +313,7 @@ export function SidebarSessionsSection({
         activeSessionId={activeSessionId}
         className={contentClassName}
         entries={displayEntries}
+        getScrollElement={getScrollElement}
         onArchiveSession={onArchiveSession}
         onBranchSession={onBranchSession}
         onDeleteSession={onDeleteSession}
@@ -342,6 +351,7 @@ export function SidebarSessionsSection({
     <SidebarGroup className={rootClassName}>
       <SidebarSectionHeader
         action={headerAction}
+        className={headerClassName}
         collapsible={collapsible}
         icon={labelIcon}
         label={label}

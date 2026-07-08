@@ -27,6 +27,10 @@ interface VirtualSessionListProps {
   activeSessionId: null | string
   className?: string
   entries: SidebarSessionEntry[]
+  /** When provided, the virtualizer uses this as its scroll element instead of
+   *  owning its own overflow container. Use this to unify scrolling with
+   *  sibling content (categories, pinned) in a shared scroll container. */
+  getScrollElement?: () => HTMLElement | null
   onArchiveSession: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onDeleteSession: (sessionId: string) => void
@@ -44,6 +48,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   activeSessionId,
   className,
   entries,
+  getScrollElement: getScrollElementProp,
   onArchiveSession,
   onBranchSession,
   onDeleteSession,
@@ -55,11 +60,16 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
 }) => {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
 
+  // When an external scroll element is provided (shared-scroll mode), use it
+  // instead of owning our own overflow container. This lets categories, pinned
+  // sessions, and virtualized recents all scroll together in one container.
+  const resolvedGetScrollElement = getScrollElementProp ?? (() => scrollerRef.current)
+
   const virtualizer = useVirtualizer({
     count: entries.length,
     estimateSize: () => ROW_ESTIMATE_PX,
     getItemKey: index => entries[index]?.session.id ?? index,
-    getScrollElement: () => scrollerRef.current,
+    getScrollElement: resolvedGetScrollElement,
     // jsdom-friendly default; the real rect takes over on first observe.
     initialRect: { height: 600, width: 240 },
     overscan: OVERSCAN_ROWS
@@ -115,10 +125,19 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   // When sortable, the caller wraps this in a ReorderableList that owns the
   // DndContext + SortableContext (keyed on the same ids); the virtualized rows
   // just consume that context via useSortable.
+  // When an external scroll element is provided (shared-scroll mode), the
+  // outer container handles scrolling — we just render the spacer rows.
+  // Otherwise we own our own overflow-y-auto scroll container.
+  const ownsScroll = !getScrollElementProp
+
   return (
     <div
-      className={cn('relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain', className)}
-      ref={scrollerRef}
+      className={cn(
+        'relative min-h-0 overflow-x-hidden overscroll-contain',
+        ownsScroll && 'flex-1 overflow-y-auto',
+        className
+      )}
+      ref={ownsScroll ? scrollerRef : undefined}
     >
       <div className="grid gap-px" style={{ paddingBottom: `${paddingBottom}px`, paddingTop: `${paddingTop}px` }}>
         {rows}
