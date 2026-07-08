@@ -43,6 +43,9 @@ for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agen
   if [ -f "$candidate/bin/activate" ]; then
     VENV="$candidate"
     break
+  elif [ -f "$candidate/Scripts/activate" ]; then
+    VENV="$candidate"
+    break
   fi
 done
 
@@ -51,7 +54,14 @@ if [ -z "$VENV" ]; then
   exit 1
 fi
 
-PYTHON="$VENV/bin/python"
+if [ -f "$VENV/bin/python" ]; then
+  PYTHON="$VENV/bin/python"
+elif [ -f "$VENV/Scripts/python.exe" ]; then
+  PYTHON="$VENV/Scripts/python.exe"
+else
+  echo "error: no python found in $VENV" >&2
+  exit 1
+fi
 
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────

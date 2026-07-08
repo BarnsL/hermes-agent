@@ -57,6 +57,8 @@ import {
   setSidebarWorkspaceOrderIds,
   setSidebarWorkspaceParentOrderIds,
   SIDEBAR_SESSIONS_PAGE_SIZE,
+  $sidebarCategoryOrderIds,
+  setCategoryOrder,
   toggleSidebarMessagingOpen,
   unpinSession
 } from '@/store/layout'
@@ -157,9 +159,12 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
 const COMPACT_FLAT = 'compact:max-h-none compact:overflow-visible'
 
 // Vertical scroll only — never a horizontal bar from glow bleed, long titles, etc.
-// overscroll-contain removed: causes scroll wheel to lock at bottom in Electron/Chromium
-// (wheel events consumed at boundary, requiring scroll-up to unstick).
-const SCROLL_Y = 'overflow-y-auto overflow-x-hidden'
+// overflow-y-scroll (not auto): forces Chromium/Electron to always treat this as
+// a scroll container. With overflow-y-auto, wheel events on child elements
+// (session rows) sometimes fail to bubble to the scroll container — scrolling
+// only works when the cursor is directly on the scrollbar track. 'scroll' fixes
+// the hit-test so wheel events always reach the right element.
+const SCROLL_Y = 'overflow-y-scroll overflow-x-hidden'
 
 // A non-session group's scroll body: capped at max-height, clipped (no own
 // scroll — the shared outer container handles all scrolling). overflow-hidden
@@ -329,6 +334,12 @@ export function ChatSidebar({
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   )
+
+  // Category reorder: respect persisted order, append new uncategorized categories at end.
+  const categoryOrderIds = useStore($sidebarCategoryOrderIds)
+  const reorderCategories = (ids: string[]) => {
+    setCategoryOrder(ids)
+  }
 
   // Profile scope = the "workspace switcher" context. Concrete scope shows only
   // that profile's sessions (clean rows, no per-row tags); ALL fans every
@@ -1144,7 +1155,8 @@ export function ChatSidebar({
         )}
 
         {contentVisible && showSessionSections && (
-          <div className={cn('flex min-h-0 flex-1 flex-col pb-1.75', SCROLL_Y)} ref={scrollContainerRef}>
+          <>
+            <div className={cn('flex min-h-0 flex-1 flex-col pb-1.75', SCROLL_Y)} ref={scrollContainerRef}>
             {trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
@@ -1200,9 +1212,12 @@ export function ChatSidebar({
             {!trimmedQuery && (
               <SessionCategoriesSection
                 activeSessionId={activeSidebarSessionId}
+                categoryOrderIds={categoryOrderIds}
+                dndSensors={dndSensors}
                 onArchiveSession={onArchiveSession}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
+                onReorderCategories={reorderCategories}
                 onResumeSession={onResumeSession}
                 sessionById={sessionByAnyId}
                 workingSessionIdSet={workingSessionIdSet}
@@ -1355,12 +1370,13 @@ export function ChatSidebar({
                 workingSessionIdSet={workingSessionIdSet}
               />
             )}
+          </div>
 
-            {!trimmedQuery &&
-              !worktreeGroupingActive &&
-              (messagingGroups.length > 0 || cronJobs.length > 0) && (
-                <div className="shrink-0 border-t border-(--ui-stroke-tertiary) pt-1.5 mt-auto">
-                  {messagingGroups.map(group => {
+          {!trimmedQuery &&
+            !worktreeGroupingActive &&
+            (messagingGroups.length > 0 || cronJobs.length > 0) && (
+              <div className="shrink-0 border-t border-(--ui-stroke-tertiary) pt-1.5">
+                {messagingGroups.map(group => {
                     const visible = messagingVisible[group.sourceId] ?? NON_SESSION_INITIAL_ROWS
                     const shownSessions = group.sessions.slice(0, visible)
                     const canRevealMore = visible < group.sessions.length || group.hasMore
@@ -1415,8 +1431,8 @@ export function ChatSidebar({
                     />
                   )}
                 </div>
-              )}
-          </div>
+            )}
+          </>
         )}
 
         {contentVisible && !showSessionSections && <SidebarBlankState onNewProject={openProjectCreate} />}
