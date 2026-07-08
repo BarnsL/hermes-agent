@@ -1359,63 +1359,61 @@ export function ChatSidebar({
               (messagingGroups.length > 0 || cronJobs.length > 0) && (
                 <div className="shrink-0 border-t border-(--ui-stroke-tertiary) pt-1.5">
                   {messagingGroups.map(group => {
-                const visible = messagingVisible[group.sourceId] ?? NON_SESSION_INITIAL_ROWS
-                const shownSessions = group.sessions.slice(0, visible)
-                // More to show if rows are hidden behind the cap, or the backend
-                // still has older threads on disk.
-                const canRevealMore = visible < group.sessions.length || group.hasMore
+                    const visible = messagingVisible[group.sourceId] ?? NON_SESSION_INITIAL_ROWS
+                    const shownSessions = group.sessions.slice(0, visible)
+                    const canRevealMore = visible < group.sessions.length || group.hasMore
 
-                return (
-                  <SidebarSessionsSection
-                    activeSessionId={activeSidebarSessionId}
-                    contentClassName={cn('flex max-h-56 flex-col gap-px pb-1.75', GROUP_BODY)}
-                    emptyState={null}
-                    footer={
-                      canRevealMore ? (
-                        <SidebarLoadMoreRow
-                          loading={Boolean(messagingLoadMorePending[group.sourceId])}
-                          onClick={() => revealMoreMessaging(group.sourceId, group.sessions.length, group.hasMore)}
-                          step={Math.min(NON_SESSION_LOAD_STEP, Math.max(0, group.total - shownSessions.length))}
-                        />
-                      ) : null
-                    }
-                    key={group.sourceId}
-                    label={group.label}
-                    labelIcon={
-                      <PlatformAvatar
-                        className="size-4 rounded-[4px] text-[0.5625rem] [&_svg]:size-3"
-                        platformId={group.sourceId}
-                        platformName={group.label}
+                    return (
+                      <SidebarSessionsSection
+                        activeSessionId={activeSidebarSessionId}
+                        contentClassName={cn('flex max-h-56 flex-col gap-px pb-1.75', GROUP_BODY)}
+                        emptyState={null}
+                        footer={
+                          canRevealMore ? (
+                            <SidebarLoadMoreRow
+                              loading={Boolean(messagingLoadMorePending[group.sourceId])}
+                              onClick={() => revealMoreMessaging(group.sourceId, group.sessions.length, group.hasMore)}
+                              step={Math.min(NON_SESSION_LOAD_STEP, Math.max(0, group.total - shownSessions.length))}
+                            />
+                          ) : null
+                        }
+                        key={group.sourceId}
+                        label={group.label}
+                        labelIcon={
+                          <PlatformAvatar
+                            className="size-4 rounded-[4px] text-[0.5625rem] [&_svg]:size-3"
+                            platformId={group.sourceId}
+                            platformName={group.label}
+                          />
+                        }
+                        labelMeta={countLabel(group.sessions.length, group.total)}
+                        onArchiveSession={onArchiveSession}
+                        onDeleteSession={onDeleteSession}
+                        onResumeSession={onResumeSession}
+                        onToggle={() => toggleSidebarMessagingOpen(group.sourceId)}
+                        onTogglePin={pinSession}
+                        open={messagingOpenIds.includes(group.sourceId)}
+                        pinned={false}
+                        rootClassName="shrink-0 p-0"
+                        sessions={shownSessions}
+                        workingSessionIdSet={workingSessionIdSet}
                       />
-                    }
-                    labelMeta={countLabel(group.sessions.length, group.total)}
-                    onArchiveSession={onArchiveSession}
-                    onDeleteSession={onDeleteSession}
-                    onResumeSession={onResumeSession}
-                    onToggle={() => toggleSidebarMessagingOpen(group.sourceId)}
-                    onTogglePin={pinSession}
-                    open={messagingOpenIds.includes(group.sourceId)}
-                    pinned={false}
-                    rootClassName="shrink-0 p-0"
-                    sessions={shownSessions}
-                    workingSessionIdSet={workingSessionIdSet}
-                  />
-                )
-              })}
+                    )
+                  })}
 
-            {!trimmedQuery && !worktreeGroupingActive && cronJobs.length > 0 && (
-              <SidebarCronJobsSection
-                jobs={cronJobs}
-                label={s.cronJobs}
-                onManageJob={onManageCronJob}
-                onOpenRun={onResumeSession}
-                onToggle={() => setSidebarCronOpen(!cronOpen)}
-                onTriggerJob={onTriggerCronJob}
-                open={cronOpen}
-              />
-            )}
-              </div>
-            )}
+                  {cronJobs.length > 0 && (
+                    <SidebarCronJobsSection
+                      jobs={cronJobs}
+                      label={s.cronJobs}
+                      onManageJob={onManageCronJob}
+                      onOpenRun={onResumeSession}
+                      onToggle={() => setSidebarCronOpen(!cronOpen)}
+                      onTriggerJob={onTriggerCronJob}
+                      open={cronOpen}
+                    />
+                  )}
+                </div>
+              )}
           </div>
         )}
 
