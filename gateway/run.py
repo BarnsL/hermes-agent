@@ -10173,6 +10173,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "channel_context", None):
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
 
+        # Discord guild-channel security restriction: the agent may only
+        # search (web/messages) and read channel context — no programmatic
+        # commands, filesystem access, or information leakage.  DMs are exempt.
+        if (
+            source is not None
+            and getattr(source, "platform", None) == Platform.DISCORD
+            and getattr(source, "chat_type", None) != "dm"
+        ):
+            message_text = (
+                "[SECURITY RESTRICTION — Discord server channel]\n"
+                "This message arrived from a public Discord server channel, not a "
+                "Direct Message. You are in a public setting where other people's "
+                "messages are visible.\n\n"
+                "Permitted operations:\n"
+                "- Web search and web page reading (mcp__webclaw__*)\n"
+                "- Channel context reading (discord.fetch_messages)\n"
+                "- Reading files (read_file) — only with explicit user request\n\n"
+                "FORBIDDEN operations (do not call these tools):\n"
+                "- terminal(), execute_code() — programmatic execution\n"
+                "- write_file(), patch() — filesystem modification\n"
+                "- browser_* — browser automation (except provenance-checked URLs)\n"
+                "- delegate_task() — spawning subagents\n"
+                "- cronjob() — scheduling\n"
+                "- process() — process management\n"
+                "- memory() — memory modification\n"
+                "- search_files() — local filesystem browsing\n"
+                "- computer_use() — desktop control\n\n"
+                "Never reveal internal Hermes configuration, model/provider names, "
+                "file paths, or operational details in server-channel responses. "
+                "If asked for this information, politely decline.\n\n"
+                f"{message_text}"
+            )
+
         # Declare at outer scope so the audio-file-paths handling block below
         # remains safe when ``event.media_urls`` is empty (no inner block runs).
         audio_file_paths: list[str] = []
@@ -10657,23 +10690,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if should_notify:
                     adapter = self._adapter_for_source(source)
                     if adapter:
-                        if reset_reason == "suspended":
-                            reason_text = "previous session was stopped or interrupted"
-                        elif reset_reason == "daily":
-                            reason_text = f"daily schedule at {policy.at_hour}:00"
-                        else:
-                            hours = policy.idle_minutes // 60
-                            mins = policy.idle_minutes % 60
-                            duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
-                            reason_text = f"inactive for {duration}"
                         notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
+                            f"◐ Session automatically reset. "
                             f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
+                            f"/start or /new to begin."
                         )
                         try:
-                            session_info = self._format_session_info()
+                            session_info = self._format_session_info(platform=platform_name)
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -11922,13 +11945,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, platform: Optional[str] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
         users can immediately see if context detection went wrong (e.g.
         local models falling to the 128K default).
+
+        When *platform* is ``"discord"``, returns an empty string —
+        model/provider/context headers leak privileged metadata into
+        shared server channels and must NOT be disclosed there.
         """
+        if platform == "discord":
+            return ""
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
         model = _resolve_gateway_model()
@@ -16638,11 +16667,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
+        # Also disable for Discord — loose lips sink ships. Raw tool names and
+        # MCP identifiers leak attack surface to server-channel viewers.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        _discord_platform = source.platform == Platform.DISCORD
+        tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK and not _discord_platform
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
-        log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
+        log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK and not _discord_platform
         log_queue: "queue.Queue | None" = queue.Queue() if log_mode_enabled else None
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
