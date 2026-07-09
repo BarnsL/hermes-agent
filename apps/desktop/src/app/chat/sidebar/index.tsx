@@ -57,8 +57,6 @@ import {
   setSidebarWorkspaceOrderIds,
   setSidebarWorkspaceParentOrderIds,
   SIDEBAR_SESSIONS_PAGE_SIZE,
-  $sidebarCategoryOrderIds,
-  setCategoryOrder,
   toggleSidebarMessagingOpen,
   unpinSession
 } from '@/store/layout'
@@ -298,6 +296,21 @@ export function ChatSidebar({
   const [messagingVisible, setMessagingVisible] = useState<Record<string, number>>({})
   const searchInputRef = useRef<HTMLInputElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
+
+  // Native wheel listener: Electron/Chromium fails to route wheel events from
+  // child elements (session rows) to the scroll container. This manually sets
+  // scrollTop, bypassing Chromium's event routing entirely.
+  useEffect(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      el.scrollTop += e.deltaY
+      e.preventDefault()
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [])
+
   const trimmedQuery = searchQuery.trim()
 
   // Hotkey (session.focusSearch) → focus the field once it's mounted.
@@ -334,12 +347,6 @@ export function ChatSidebar({
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   )
-
-  // Category reorder: respect persisted order, append new uncategorized categories at end.
-  const categoryOrderIds = useStore($sidebarCategoryOrderIds)
-  const reorderCategories = (ids: string[]) => {
-    setCategoryOrder(ids)
-  }
 
   // Profile scope = the "workspace switcher" context. Concrete scope shows only
   // that profile's sessions (clean rows, no per-row tags); ALL fans every
@@ -1212,12 +1219,9 @@ export function ChatSidebar({
             {!trimmedQuery && (
               <SessionCategoriesSection
                 activeSessionId={activeSidebarSessionId}
-                categoryOrderIds={categoryOrderIds}
-                dndSensors={dndSensors}
                 onArchiveSession={onArchiveSession}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
-                onReorderCategories={reorderCategories}
                 onResumeSession={onResumeSession}
                 sessionById={sessionByAnyId}
                 workingSessionIdSet={workingSessionIdSet}
