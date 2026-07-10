@@ -137,6 +137,64 @@ def _warn_config_parse_failure(config_path: Path, exc: Exception) -> None:
     except Exception:
         pass
 
+def _lastgood_config_path(config_path: Path) -> Path:
+    return config_path.with_name(config_path.name + ".good")
+
+
+def _config_has_model(user_config: Any) -> bool:
+    """True when a parsed config carries a usable model block.
+
+    RECURRING ISSUE R-6 (see RECURRING-ISSUES-AND-GAMEPLAN-2026-07-09.md): the
+    2026-07-09 corruption produced VALID yaml that had simply lost its ``model:``
+    section. A valid-but-model-less config must NOT be captured as "last-good",
+    or the safety net would preserve exactly the state that burns the Claude
+    subscription. Require an explicit provider or default.
+    """
+    if not isinstance(user_config, dict):
+        return False
+    mc = user_config.get("model")
+    if isinstance(mc, str):
+        return bool(mc.strip())
+    if isinstance(mc, dict):
+        return bool(mc.get("provider") or mc.get("default"))
+    return False
+
+
+def _persist_lastgood_config(config_path: Path, user_config: Any) -> None:
+    """Snapshot a known-good config.yaml (raw bytes, comments preserved).
+
+    Best-effort and side-effect-free on failure (mirrors _backup_corrupt_config).
+    Only called on a SUCCESSFUL parse that _config_has_model() approves, so the
+    ``.good`` copy is always both parseable AND model-bearing — the two
+    properties the R-6 fallback needs. Skips the write when bytes are unchanged.
+    """
+    if not _config_has_model(user_config):
+        return
+    try:
+        good = _lastgood_config_path(config_path)
+        src = config_path.read_bytes()
+        if good.exists() and good.read_bytes() == src:
+            return
+        tmp = good.with_name(good.name + ".tmp")
+        tmp.write_bytes(src)
+        os.replace(tmp, good)
+    except Exception:
+        pass
+
+
+def _load_lastgood_config(config_path: Path) -> Optional[dict]:
+    """Return the parsed last-good config dict, or None if unavailable."""
+    try:
+        good = _lastgood_config_path(config_path)
+        if not good.exists():
+            return None
+        with open(good, encoding="utf-8") as f:
+            data = fast_safe_load(f)
+        return data if isinstance(data, dict) and _config_has_model(data) else None
+    except Exception:
+        return None
+
+
 _IS_WINDOWS = platform.system() == "Windows"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -6876,8 +6934,39 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config.pop("max_turns", None)
 
                 config = _deep_merge(config, user_config)
+
+                # R-6/G-4: snapshot this parseable, model-bearing config as
+                # last-good so a future corruption can fall back to it instead
+                # of collapsing to DEFAULT_CONFIG (empty model → subscription
+                # burn). Best-effort; only writes when bytes changed.
+                _persist_lastgood_config(config_path, user_config)
             except Exception as e:
                 _warn_config_parse_failure(config_path, e)
+
+                # R-6/G-4: the live config failed to parse. Rather than run on
+                # pure DEFAULT_CONFIG (which has model="" and fails open onto the
+                # Claude subscription), recover the last-good copy if we have one.
+                _lastgood = _load_lastgood_config(config_path)
+                if _lastgood is not None:
+                    if "max_turns" in _lastgood:
+                        _lg_agent = dict(_lastgood.get("agent") or {})
+                        if _lg_agent.get("max_turns") is None:
+                            _lg_agent["max_turns"] = _lastgood["max_turns"]
+                        _lastgood["agent"] = _lg_agent
+                        _lastgood.pop("max_turns", None)
+                    config = _deep_merge(config, _lastgood)
+                    _lg_msg = (
+                        f"config.yaml is corrupt — running on the last-good copy "
+                        f"({_lastgood_config_path(config_path).name}). Fix "
+                        f"config.yaml and restart; until then model/mcp/session "
+                        f"settings come from the last-good snapshot."
+                    )
+                    logger.error(_lg_msg)
+                    try:
+                        sys.stderr.write(f"⚠️  hermes config: {_lg_msg}\n")
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars(normalized)
