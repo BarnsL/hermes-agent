@@ -1266,7 +1266,11 @@ const UPDATE_HANDOFF_DWELL_MS = 2500
 // Emits a boot-progress phase so the renderer shows "Update in progress…"
 // rather than a frozen splash. Returns true if it parked at all.
 async function waitForUpdateToFinish() {
-  let marker = readLiveUpdateMarker(HERMES_HOME)
+  // audit S-4 / CRITICAL #2: log when a stale update marker is self-healed, so
+  // a "won't boot → suddenly boots" no longer happens without a breadcrumb.
+  const onStale = reason =>
+    rememberLog(`[updates] cleared stale .hermes-update-in-progress (${reason}); proceeding with boot`)
+  let marker = readLiveUpdateMarker(HERMES_HOME, { onStale })
   if (!marker) return false
 
   rememberLog(`[updates] update in progress (pid=${marker.pid}); deferring backend start until it finishes`)
@@ -1278,7 +1282,7 @@ async function waitForUpdateToFinish() {
       12
     )
     await new Promise(r => setTimeout(r, UPDATE_WAIT_POLL_MS))
-    marker = readLiveUpdateMarker(HERMES_HOME)
+    marker = readLiveUpdateMarker(HERMES_HOME, { onStale })
   }
   if (marker) {
     rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')

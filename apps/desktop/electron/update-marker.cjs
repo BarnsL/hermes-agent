@@ -59,7 +59,7 @@ function isPidAlive(pid, kill = process.kill.bind(process)) {
  * Pure-ish: file I/O against the given path, plus an injectable pid probe and
  * clock for tests.
  */
-function readLiveUpdateMarker(hermesHome, { kill, now = Date.now, maxAgeMs = UPDATE_MARKER_MAX_AGE_MS } = {}) {
+function readLiveUpdateMarker(hermesHome, { kill, now = Date.now, maxAgeMs = UPDATE_MARKER_MAX_AGE_MS, onStale } = {}) {
   const file = markerPath(hermesHome)
   let raw
   try {
@@ -75,6 +75,16 @@ function readLiveUpdateMarker(hermesHome, { kill, now = Date.now, maxAgeMs = UPD
   const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
 
   if (!alive || ageMs > maxAgeMs) {
+    // CRITICAL #2 / audit S-4: a stale .hermes-update-in-progress used to
+    // strand boot forever. The self-heal (delete) has always been here but was
+    // SILENT, so the recurring "desktop won't boot" reports had no breadcrumb.
+    // Emit the reason via an injected callback (kept pure-ish for tests).
+    if (typeof onStale === 'function') {
+      const reason = !alive
+        ? `dead pid ${Number.isInteger(pid) ? pid : '?'}`
+        : `age ${Math.round(ageMs / 1000)}s > ${Math.round(maxAgeMs / 1000)}s ceiling`
+      try { onStale(reason) } catch { void 0 }
+    }
     try {
       fs.unlinkSync(file)
     } catch {
