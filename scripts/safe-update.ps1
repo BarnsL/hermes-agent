@@ -58,7 +58,7 @@ if ([int]$behind -gt 0) {
 # --- 2) Verify the hardening survived (the checks that used to regress) --------
 $checks = @(
     @{ File = "apps\desktop\electron\backend-ready.cjs"; Pattern = 'BACKEND\|DASHBOARD';           Why = "ready-token regex (CRITICAL #6/#9)" },
-    @{ File = "gateway\run.py";                           Pattern = 'channel_locked';               Why = "Discord guild tool lockdown" },
+    @{ File = "gateway\run.py";                           Pattern = 'SECURITY RESTRICTION';         Why = "Discord guild tool lockdown" },
     @{ File = "gateway\run.py";                           Pattern = 'RECURRING ISSUE R-6';          Why = "fail-closed model fallback (R-6)" },
     @{ File = "agent\pkg_guard.py";                       Pattern = 'verify_package_health';        Why = "Defender-gutting auto-restore" },
     @{ File = "plugins\memory\memory_tencentdb\__init__.py"; Pattern = 'RECURRING ISSUE R-3';       Why = "tencentdb Windows guard (R-3)" }
