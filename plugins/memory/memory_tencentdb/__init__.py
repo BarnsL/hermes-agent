@@ -713,6 +713,30 @@ class MemoryTencentdbProvider(MemoryProvider):
         Prefers local config checks (env vars) to avoid blocking network calls.
         Only falls back to health check when no env config is present.
         """
+        # ─── RECURRING ISSUE R-3: WINDOWS HARD-STOP ──────────────────────────
+        # On Windows the auto-discovered launcher is `sh -c ...` (see
+        # _discover_gateway_cmd → line ~262) and there is no `sh` on PATH, so
+        # the supervisor Popen()s it into a WinError-2 loop (~1 failure / 7s;
+        # 1,662 in one afternoon on 2026-07-08). Report UNAVAILABLE up front
+        # unless the operator supplied a Windows-native launcher via
+        # MEMORY_TENCENTDB_GATEWAY_CMD (checked first, below). The PORT env var
+        # alone must NOT flag availability on Windows, because it triggers the
+        # auto-discovery/sh path. See __init__.py initialize() guard + G-5.
+        _explicit_cmd = os.environ.get("MEMORY_TENCENTDB_GATEWAY_CMD")
+        if os.name == "nt" and not _explicit_cmd:
+            # Only "available" if a Gateway is ALREADY running (health check),
+            # never by virtue of config that would spawn the broken sh launcher.
+            host = _resolve_gateway_host()
+            port = _resolve_gateway_port()
+            try:
+                client = MemoryTencentdbSdkClient(
+                    base_url=f"http://{host}:{port}",
+                    timeout=2,
+                    api_key=_resolve_gateway_api_key(),
+                )
+                return client.health(timeout=2).get("status") in ("ok", "degraded")
+            except Exception:
+                return False
         # Fast path: env var configured → assume available (will verify in initialize)
         if os.environ.get("MEMORY_TENCENTDB_GATEWAY_CMD"):
             return True
@@ -765,6 +789,55 @@ class MemoryTencentdbProvider(MemoryProvider):
         # it only runs when the env var is not set, so existing deployments
         # are unaffected.
         gateway_cmd = os.environ.get("MEMORY_TENCENTDB_GATEWAY_CMD") or _discover_gateway_cmd()
+
+        # ─── RECURRING ISSUE R-3: WINDOWS HARD-STOP (definitive) ─────────────
+        # If the resolved launcher is the Unix `sh -c ...` form and we are on
+        # Windows, refuse PERMANENTLY here — before the supervisor (and its
+        # 10s watchdog) is ever created — so the WinError-2 retry storm can
+        # never start. This is the single point that turns 1,662 failures into
+        # exactly one log line. An operator who sets MEMORY_TENCENTDB_GATEWAY_CMD
+        # to a Windows-native command (e.g. `cmd /c ...` or a direct node path)
+        # bypasses this guard and runs normally. See RECURRING-ISSUES-AND-
+        # GAMEPLAN-2026-07-09.md (G-5) and the `sh -c` annotation in
+        # _discover_gateway_cmd().
+        if os.name == "nt" and (not gateway_cmd or gateway_cmd.strip().startswith("sh ")):
+            # We would have to SPAWN via the broken `sh -c`. But if a Gateway is
+            # ALREADY reachable (started by other means), just connect to it —
+            # only refuse when we'd otherwise start the WinError-2 spawn loop.
+            _already_running = False
+            try:
+                _probe = MemoryTencentdbSdkClient(
+                    base_url=f"http://{host}:{port}", timeout=2,
+                    api_key=_resolve_gateway_api_key(),
+                )
+                _already_running = _probe.health(timeout=2).get("status") in ("ok", "degraded")
+            except Exception:
+                _already_running = False
+
+            if not _already_running:
+                logger.warning(
+                    "memory-tencentdb: DISABLED on Windows — the auto-discovered "
+                    "Gateway launcher is a Unix `sh -c` command and there is no `sh` "
+                    "on PATH (would fail with WinError 2 on a retry loop, R-3), and "
+                    "no Gateway is currently reachable to connect to. Memory "
+                    "features are OFF. To enable: set memory.provider elsewhere, or "
+                    "set MEMORY_TENCENTDB_GATEWAY_CMD to a Windows-native launcher "
+                    "(e.g. `cmd /c \"...\"`)."
+                )
+                self._supervisor = None
+                self._client = None
+                self._gateway_available = False
+                self._initialized = False   # inert
+                self._hard_disabled = True  # get_tool_schemas() hides the tools
+                return
+            # A Gateway is up — fall through to normal init, which attaches to it
+            # via the is_running() fast path below (no spawn attempted).
+            logger.info(
+                "memory-tencentdb: `sh -c` launcher on Windows, but a Gateway is "
+                "already reachable at %s:%d — connecting instead of spawning.",
+                host, port,
+            )
+
         # Optional Bearer token attached to outbound Gateway requests
         # (off by default). The plugin only handles the client side — if
         # the operator wants the Gateway to enforce auth, they must
@@ -1013,6 +1086,11 @@ class MemoryTencentdbProvider(MemoryProvider):
     # -- Tools ----------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        # R-3 (G-5): once the Windows sh-launcher hard-stop has fired, the
+        # plugin is permanently inert — hide the tools so the LLM never sees a
+        # memory tool that can only ever answer "Gateway is not connected".
+        if getattr(self, "_hard_disabled", False):
+            return []
         # Optimistically return tool schemas if Gateway is configured or running.
         # This is critical because MemoryManager.add_provider() calls
         # get_tool_schemas() BEFORE initialize() to build the _tool_to_provider

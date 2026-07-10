@@ -3524,6 +3524,23 @@ def _try_main_agent_model_fallback(
         _log_skip_unhealthy(main_provider, task)
         return None, None, ""
 
+    # ─── RECURRING ISSUE R-4/R-6 (vision): DON'T SEND IMAGES TO A TEXT MODEL ──
+    # When an auxiliary VISION call (e.g. the local Ollama qwen2.5vl) fails or
+    # times out, this safety net used to re-send the SAME image_url messages to
+    # the main agent model. On DeepSeek (text-only) that returns the cryptic
+    # `unknown variant image_url, expected text` 400 (#31179) — 67 such errors
+    # 2026-07-06..09. Skip the main-model fallback for vision when the main model
+    # can't accept images; the original vision error (usually the Ollama
+    # timeout) then re-raises and vision_tools turns it into a clear tool error.
+    if task == "vision" and not _main_model_supports_vision(main_provider, main_model):
+        logger.info(
+            "Auxiliary vision: skipping main-agent fallback %s (%s) — model does "
+            "not accept image input (would 400 'unknown variant image_url'). "
+            "Surfacing the original vision error instead. (R-4)",
+            main_provider, main_model,
+        )
+        return None, None, ""
+
     try:
         client, resolved_model = resolve_provider_client(
             provider=main_provider, model=main_model,
