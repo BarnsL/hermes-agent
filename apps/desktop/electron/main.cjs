@@ -66,6 +66,7 @@ const {
   collectRelaunchEnv,
   buildRelaunchScript
 } = require('./update-relaunch.cjs')
+const { incrementBoot, logShutdown, incrementRestart, getCounts } = require('./restart-counter.cjs')
 const { gitRootForIpc } = require('./git-root.cjs')
 const { addWorktree, listBranches, listWorktrees, removeWorktree, switchBranch } = require('./git-worktree-ops.cjs')
 const {
@@ -4025,24 +4026,15 @@ function createTray() {
       },
       {
         label: 'Restart Hermes',
-        click: async () => {
-          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide()
-          try {
-            await teardownPrimaryBackendAndWait()
-            await new Promise(r => setTimeout(r, 1000))
-            await startHermes()
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.show()
-              mainWindow.webContents.reloadIgnoringCache()
-              mainWindow.focus()
-            } else {
-              createWindow()
-            }
-          } catch (err) {
-            rememberLog(`[tray] restart failed: ${err.message}`)
-            if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show()
-            else createWindow()
-          }
+        click: () => {
+          // Full restart: quit + relaunch (confirmed reliable pattern)
+          // Electron's app.relaunch() spawns a new instance on exit
+          incrementRestart()
+          rememberLog('[tray] restart triggered')
+          isQuitting = true
+          if (tray) { tray.destroy(); tray = null }
+          app.relaunch()
+          app.exit()
         }
       },
       { type: 'separator' },
@@ -5665,6 +5657,28 @@ async function startHermes() {
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
+
+    // Kill any existing backend BEFORE spawning a new one. Without this guard,
+    // a renderer reconnect that races with the old backend's exit handler can
+    // spawn a second (third, …) gateway child, each on its own ephemeral port,
+    // all competing for state.db. The old child may still be tearing down
+    // (asyncio cleanup, atexit hooks) — give it a grace period then force-kill.
+    if (hermesProcess && !hermesProcess.killed) {
+      rememberLog(`Killing existing Hermes backend (pid ${hermesProcess.pid}) before spawning new one`)
+      try {
+        hermesProcess.kill('SIGTERM')
+      } catch { /* already dead */ }
+      // Wait up to 3 s for graceful shutdown, then force-kill.
+      await new Promise(resolve => {
+        const force = setTimeout(() => {
+          try { hermesProcess.kill('SIGKILL') } catch { /* already dead */ }
+          resolve()
+        }, 3_000)
+        hermesProcess.once('exit', () => { clearTimeout(force); resolve() })
+      })
+      hermesProcess = null
+      connectionPromise = null
+    }
 
     hermesProcess = spawn(
       backend.command,
@@ -7689,6 +7703,7 @@ app.on('open-url', (event, url) => {
 })
 
 app.whenReady().then(() => {
+  incrementBoot()
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
   } else {
@@ -7744,6 +7759,7 @@ function configureSpellChecker() {
 }
 
 app.on('before-quit', () => {
+  logShutdown('app.before-quit')
   isQuitting = true
   if (tray) { tray.destroy(); tray = null }
   // The always-on-top overlay isn't a "real" app window; close it so a stray

@@ -640,7 +640,13 @@ def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> 
 
     verb = _TOOL_VERBS.get(tool_name)
     if not verb:
-        return build_tool_preview(tool_name, args, max_len=max_len)
+        # MCP / plugin tools: strip the prefix and give a generic label
+        if tool_name.startswith("mcp__"):
+            parts = tool_name.split("__", 2)
+            host = parts[1] if len(parts) > 1 else ""
+            verb = "Using" if not host else f"Using {host.replace('_', ' ').title()}"
+        else:
+            return build_tool_preview(tool_name, args, max_len=max_len)
 
     if tool_name in _TOOL_VERBS_NO_PREVIEW:
         return verb

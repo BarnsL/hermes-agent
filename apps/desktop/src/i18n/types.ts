@@ -1687,6 +1687,10 @@ export interface Translations {
       running: (count: number) => string
       cron: string
       openCron: string
+      clearIdle: string
+      clearIdleTitle: string
+      sessionsReleased: (count: number) => string
+      noIdleToRelease: string
       starmap: string
       openStarmap: string
       turnRunning: string

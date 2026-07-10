@@ -42,10 +42,46 @@ def _ssl_err(message: str) -> SSLConfigurationError:
     return SSLConfigurationError(f"{message}\n{_repair_hint()}")
 
 
+def _try_vault_restore(path: Path) -> bool:
+    """CRITICAL #14: Auto-restore cacert.pem from backup vault before failing.
+
+    If Windows Defender quarantined the file, try to restore it from
+    C:\\Users\\<user>\\AppData\\Local\\hermes\\.pkg-vault\\.
+    Returns True if the file was successfully restored.
+    """
+    try:
+        vault = Path(os.environ.get("HERMES_HOME", str(Path.home() / "AppData" / "Local" / "hermes"))) / ".pkg-vault"
+        # Map common paths to vault filenames
+        vault_map = {
+            "certifi/cacert.pem": "certifi_cacert.pem",
+            "certifi/__init__.py": "certifi___init__.py",
+        }
+        rel = None
+        for pkg_rel, vault_name in vault_map.items():
+            if str(path).replace("\\\\", "/").endswith(pkg_rel.replace("/", "\\\\")):
+                rel = vault_name
+                break
+            if str(path).endswith(pkg_rel.split("/")[-1]):
+                rel = vault_name
+                break
+        if rel and (vault / rel).exists():
+            import shutil
+            shutil.copy2(vault / rel, path)
+            logger.warning("ssl_guard: AUTO-RESTORED %s from vault [CRITICAL #14]", path)
+            return True
+    except Exception as exc:
+        logger.debug("ssl_guard: vault restore failed: %s", exc)
+    return False
+
+
 def _validate_bundle_path(label: str, value: str, *, require_substantial: bool = False) -> None:
     path = Path(value).expanduser()
     if not path.exists():
-        raise _ssl_err(f"{label} points to a missing CA bundle: {value}")
+        # CRITICAL #14: Try vault restore before giving up
+        if _try_vault_restore(path) and path.exists():
+            pass  # File restored, continue with validation
+        else:
+            raise _ssl_err(f"{label} points to a missing CA bundle: {value}")
     if not path.is_file():
         raise _ssl_err(f"{label} does not point to a CA bundle file: {value}")
     if require_substantial and path.stat().st_size < 1024:
@@ -69,6 +105,18 @@ def verify_ca_bundle() -> None:
     if _skip_ssl_guard_enabled():
         logger.debug("SSL CA bundle guard skipped via HERMES_SKIP_SSL_GUARD")
         return
+
+    # --- CRITICAL ISSUE #14: certifi CA BUNDLE GUTTING (Defender) -------
+    # This function is the FIRST line of defense against the Defender gutting
+    # pattern. When Windows Defender quarantines cacert.pem (the CA bundle
+    # that certifi uses for TLS verification), _validate_bundle_path at line 48
+    # raises SSLConfigurationError BEFORE the OpenAI client creation fails
+    # with an opaque FileNotFoundError.
+    #
+    # Root cause: Windows Defender quarantines .pem files as suspicious.
+    # See also: #1 (yaml/__init__.py), #11 (numpy/__init__.py), #13 (Defender).
+    # Fix: pip install --force-reinstall certifi==2026.5.20 + add .pem exclusion.
+    # -----------------------------------------------------------------------
 
     for env_var in _CA_BUNDLE_ENV_VARS:
         value = os.getenv(env_var)

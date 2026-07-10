@@ -298,6 +298,21 @@ _EXTRA_ENV_KEYS = frozenset({
     "LANGFUSE_SECRET_KEY",
     "LANGFUSE_BASE_URL",
 })
+# --- CRITICAL ISSUE #1: PyYAML BOOTSTRAPPING DEADLOCK ---------------
+# This `import yaml` is the crash point. If PyYAML is gutted in the
+# venv (missing __init__.py, only __pycache__ remains), this import
+# succeeds but `yaml.SafeDumper` is missing. The crash happens in
+# utils.py:IndentDumper which subclasses yaml.SafeDumper at module
+# scope -- before any CLI command can execute, including `hermes update`.
+#
+# IMPACT: hermes update, hermes serve, hermes dashboard ALL fail with
+#   AttributeError: module 'yaml' has no attribute 'SafeDumper'
+#
+# ROOT CAUSE: Windows Defender quarantines yaml/__init__.py (see #13).
+# FIX: pip install --force-reinstall pyyaml==6.0.3 in the venv.
+# PREVENTION: Defender exclusions (see CRITICAL #13).
+# See CRITICAL-ISSUES.md #1, ROOT-CAUSE-ANALYSIS.md S1.
+# -------------------------------------------------------------------
 import yaml
 
 from hermes_cli.colors import Colors, color

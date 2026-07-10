@@ -5972,6 +5972,64 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"deleted": target})
 
 
+@method("session.release_idle")
+def _(rid, params: dict) -> dict:
+    """Release idle in-process sessions to free active-session slots.
+
+    ─── FEATURE #8: CLEAR IDLE SESSIONS (2026-07-07) ──────────────────────
+    Added to prevent session-cap exhaustion when many sessions accumulate.
+    The desktop UI exposes this via a "Clear Idle" button in the statusbar.
+
+    NOTE: This method is additive and does NOT affect WS connection behavior.
+    If the desktop is stuck on "connecting", the cause is elsewhere:
+    - numpy/torch import failure stalling the GIL (CRITICAL #9)
+    - asar regex mismatch preventing backend boot (CRITICAL #6/#9)
+    ────────────────────────────────────────────────────────────────────────
+
+    Idle threshold is controlled by the optional ``idle_minutes`` param
+
+    Idle threshold is controlled by the optional ``idle_minutes`` param
+    (default 30).  Only releases sessions that are not the currently
+    active/focused session and are not busy (have no running agent loop).
+    """
+    idle_minutes = int(params.get("idle_minutes", 30) or 30)
+    if idle_minutes < 1:
+        idle_minutes = 30
+    min_idle_seconds = idle_minutes * 60
+    now = time.time()
+    current_sid = str(params.get("current_session_id") or "")
+    released = 0
+    skipped_busy = 0
+
+    try:
+        with _sessions_lock:
+            snapshot = list(_sessions.items())
+    except Exception as e:
+        return _err(rid, 5036, f"could not enumerate sessions: {e}")
+
+    for sid, session in snapshot:
+        if session.get("_finalized"):
+            continue
+        if current_sid and sid == current_sid:
+            continue
+        if session.get("agent") and not session.get("agent_stopped"):
+            skipped_busy += 1
+            continue
+        last_active = float(session.get("last_active") or 0.0)
+        if last_active > 0 and (now - last_active) > min_idle_seconds:
+            try:
+                if _close_session_by_id(sid, end_reason="idle_released"):
+                    released += 1
+            except Exception:
+                pass
+
+    return _ok(rid, {
+        "released": released,
+        "skipped_busy": skipped_busy,
+        "idle_minutes": idle_minutes,
+    })
+
+
 @method("session.title")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
@@ -10993,6 +11051,22 @@ def _(rid, params: dict) -> dict:
     uses on session creation. It returns ok=False with the auth error message
     when the user's configured model cannot actually be served, so UIs can
     surface onboarding before the user submits a doomed prompt.
+
+    ─── CRITICAL #15: RPC TIMEOUT UNDER GIL PRESSURE ─────────────────────
+    This handler is in _LONG_HANDLERS (runs on thread pool). However, Python
+    threads share the GIL — if another thread holds the GIL (e.g. Windows
+    Defender scanning .pyc files during import, or concurrent agent turns),
+    this handler blocks waiting to acquire it. The desktop WS client has a
+    120s RPC timeout; if the GIL is held >120s, the RPC times out.
+
+    PROBLEM: `hermes gateway restart` can't fix this because the restart
+    signal handler also needs the GIL. Full Hermes restart (kill pythonw.exe)
+    forcibly releases the GIL and the .pyc files are already compiled on
+    restart, avoiding the Defender scan.
+
+    ROOT CAUSE: Windows Defender real-time scanning of venv .pyc files (#13).
+    FIX: Add venv to Defender exclusions (see CRITICAL-ISSUES.md #15 Fix B).
+    ───────────────────────────────────────────────────────────────────────
     """
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider

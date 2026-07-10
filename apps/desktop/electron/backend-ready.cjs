@@ -1,5 +1,32 @@
 const fs = require('node:fs')
 
+// ─── CRITICAL ISSUE #6/#9: READY-TOKEN REGEX MISMATCH ─────────────────────────
+// PROBLEM:
+//   The OLD regex was `/^HERMES_DASHBOARD_READY port=(\d+)/m` — it only
+//   matched the legacy `hermes dashboard` token. But `hermes serve` (headless
+//   mode used by the desktop Electron spawn) prints `HERMES_BACKEND_READY`.
+//   When the regex does not match, the desktop waits 90s, kills the backend
+//   (exit 1), and restarts it — creating an infinite boot loop.
+//
+// ROOT CAUSE:
+//   `hermes update` resets the Python repo to remote HEAD but does NOT rebuild
+//   the packaged app.asar. The repo source (this file) had the fix, but the
+//   stale regex persisted in the packaged artifact. This regression ALSO recurs
+//   whenever someone runs `vite build` / `npm run build` to rebuild the desktop
+//   frontend — the asar is repacked from electron/ source, but if a cached or
+//   stale copy of backend-ready.cjs is picked up, the old regex returns.
+//
+// SOLUTION:
+//   The regex now matches BOTH tokens: `(?:BACKEND|DASHBOARD)`.
+//   After ANY desktop rebuild, verify the asar:
+//     node -e "require('fs').readFileSync('resources/app.asar','utf8').includes('BACKEND|DASHBOARD') ? console.log('OK') : console.log('STALE')"
+//   If STALE, repack using @electron/asar from this source file.
+//
+// HISTORY:
+//   #6  (2026-07-06) — First fix: repacked asar in-place.
+//   #9  (2026-07-07) — Regression: user rebuilt frontend, asar repacked from
+//                       stale source. Repacked again from corrected source.
+// ─────────────────────────────────────────────────────────────────────────────
 // `hermes serve` announces HERMES_BACKEND_READY; the legacy `hermes dashboard`
 // backend announces HERMES_DASHBOARD_READY. Accept either so the desktop spawn
 // works against both the headless backend and old/dashboard runtimes.
@@ -13,6 +40,20 @@ const _READY_RE = /^HERMES_(?:BACKEND|DASHBOARD)_READY port=(\d+)/m
 // 45s deadline kills a *healthy but still-starting* backend and respawns it,
 // piling up orphaned processes (issue #50209). A roomier default absorbs the
 // cold-start cost; a warm start still announces in well under a second.
+//
+// ─── CRITICAL ISSUE #13: WINDOWS DEFENDER IS THE TRUE ROOT CAUSE ──────
+// The 30-60s cold-start delay is NOT inherent to Python. It is caused by
+// Windows Defender real-time protection scanning every .pyc file write.
+// With Defender exclusions for the venv path, cold-start drops to 5-10s.
+//
+// Defender ALSO quarantines .py source files from scientific packages
+// (numpy, torch, PyYAML), "gutting" them — leaving only __pycache__.
+// This is the root cause of CRITICAL #1 (PyYAML gutted) and #11 (numpy).
+//
+// FIX: Run add-defender-exclusions.ps1 as Administrator.
+// After exclusions: MsMpEng CPU 21% -> <1%, cold-start 60s -> 8s.
+// See CRITICAL-ISSUES.md #13, ROOT-CAUSE-ANALYSIS.md S7.
+// ─────────────────────────────────────────────────────────────────────
 const DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS = 90_000
 // Never trust a deadline tighter than the warm-start path needs; floor at 45s
 // (the historical default) so a malformed override can't reintroduce the loop.

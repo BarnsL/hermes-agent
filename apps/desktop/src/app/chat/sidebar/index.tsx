@@ -302,12 +302,18 @@ export function ChatSidebar({
   // scrollTop, bypassing Chromium's event routing entirely.
   useEffect(() => {
     const el = scrollContainerRef.current
-    if (!el) return
+
+    if (!el) {
+      return
+    }
+
     const onWheel = (e: WheelEvent) => {
       el.scrollTop += e.deltaY
       e.preventDefault()
     }
+
     el.addEventListener('wheel', onWheel, { passive: false })
+
     return () => el.removeEventListener('wheel', onWheel)
   }, [])
 

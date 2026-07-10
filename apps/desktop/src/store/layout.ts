@@ -28,6 +28,8 @@ const SIDEBAR_PROJECT_ORDER_STORAGE_KEY = 'hermes.desktop.projectOrder'
 const SIDEBAR_WORKSPACE_COLLAPSED_STORAGE_KEY = 'hermes.desktop.workspaceCollapsed'
 const SIDEBAR_DISMISSED_AUTO_PROJECTS_STORAGE_KEY = 'hermes.desktop.dismissedAutoProjects'
 const SIDEBAR_DISMISSED_WORKTREES_STORAGE_KEY = 'hermes.desktop.dismissedWorktrees'
+const SIDEBAR_CATEGORIES_STORAGE_KEY = 'hermes.desktop.sessionCategories'
+const SIDEBAR_CATEGORY_ORDER_STORAGE_KEY = 'hermes.desktop.categoryOrder'
 const PANES_FLIPPED_STORAGE_KEY = 'hermes.desktop.panesFlipped'
 const RIGHT_RAIL_ACTIVE_TAB_STORAGE_KEY = 'hermes.desktop.rightRailActiveTab'
 
@@ -331,4 +333,115 @@ export function resetSessionsLimit() {
   if ($sessionsLimit.get() !== SIDEBAR_SESSIONS_PAGE_SIZE) {
     $sessionsLimit.set(SIDEBAR_SESSIONS_PAGE_SIZE)
   }
+}
+
+// ---------------------------------------------------------------------------
+// Session Categories — multiple named groups (like Discord channels)
+// ---------------------------------------------------------------------------
+
+export interface SessionCategory {
+  id: string
+  name: string
+  sessionIds: string[]
+  color?: string
+  collapsed?: boolean
+}
+
+// Special ID for the default "Uncategorized" bucket — never persisted as a
+// real category; sessions with no explicit category assignment belong here.
+export const UNCATEGORIZED_ID = '__uncategorized__'
+
+// Persisted array of category objects.  We use a simple JSON array (not a
+// Record) so the order is explicit and a drag-reorder is just an array move.
+export const $sessionCategories = persistentAtom<SessionCategory[]>(
+  SIDEBAR_CATEGORIES_STORAGE_KEY,
+  [],
+  {
+    decode: (raw: unknown) => {
+      try { return JSON.parse(raw as string) as SessionCategory[] }
+      catch { return [] }
+    },
+    encode: (cats: SessionCategory[]) => JSON.stringify(cats)
+  } as any
+)
+
+export const $sidebarCategoryOrderIds = persistentAtom<string[]>(
+  SIDEBAR_CATEGORY_ORDER_STORAGE_KEY,
+  [],
+  Codecs.stringArray
+)
+
+let _catCounter = 0
+function _newCatId(): string {
+  return `cat_${Date.now()}_${++_catCounter}`
+}
+
+export function createCategory(name: string, color?: string): SessionCategory {
+  const cat: SessionCategory = {
+    id: _newCatId(),
+    name: name.trim() || 'New Category',
+    sessionIds: [],
+    color
+  }
+  const prev = $sessionCategories.get()
+  $sessionCategories.set([...prev, cat])
+  return cat
+}
+
+export function renameCategory(catId: string, name: string) {
+  const prev = $sessionCategories.get()
+  const next = prev.map(c => c.id === catId ? { ...c, name } : c)
+  $sessionCategories.set(next)
+}
+
+export function deleteCategory(catId: string) {
+  const prev = $sessionCategories.get()
+  $sessionCategories.set(prev.filter(c => c.id !== catId))
+}
+
+export function toggleCategoryCollapsed(catId: string) {
+  const prev = $sessionCategories.get()
+  $sessionCategories.set(prev.map(c =>
+    c.id === catId ? { ...c, collapsed: !c.collapsed } : c
+  ))
+}
+
+export function moveSessionToCategory(sessionId: string, catId: string) {
+  const prev = $sessionCategories.get()
+  // Remove from all categories first
+  const next = prev.map(c => ({
+    ...c,
+    sessionIds: c.sessionIds.filter(id => id !== sessionId)
+  }))
+  // Add to target category
+  const target = next.find(c => c.id === catId)
+  if (target && !target.sessionIds.includes(sessionId)) {
+    target.sessionIds.push(sessionId)
+  }
+  $sessionCategories.set(next)
+}
+
+export function removeSessionFromCategory(sessionId: string, catId: string) {
+  const prev = $sessionCategories.get()
+  $sessionCategories.set(prev.map(c =>
+    c.id === catId
+      ? { ...c, sessionIds: c.sessionIds.filter(id => id !== sessionId) }
+      : c
+  ))
+}
+
+export function setCategorySessionOrder(catId: string, sessionIds: string[]) {
+  const prev = $sessionCategories.get()
+  $sessionCategories.set(prev.map(c =>
+    c.id === catId ? { ...c, sessionIds } : c
+  ))
+}
+
+export function setCategoryOrder(catIds: string[]) {
+  $sidebarCategoryOrderIds.set(catIds)
+}
+
+/** Return the category a session belongs to, or null if uncategorized. */
+export function getSessionCategory(sessionId: string): SessionCategory | null {
+  return $sessionCategories.get().find(c => c.sessionIds.includes(sessionId)) ?? null
 }

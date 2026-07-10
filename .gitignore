@@ -144,3 +144,10 @@ apps/desktop/demo/
 # PR body is the archive. See the hermes-agent-dev skill's
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
+
+# Local repair-session scratch (asar extractions, annotation snapshots).
+# These are regenerable debugging artifacts from the 2026-07 hardening work;
+# never commit them. See RECURRING-ISSUES-AND-GAMEPLAN-2026-07-09.md (G-7).
+apps/desktop/asar-*/
+apps/desktop/check-tray/
+*.annotation-bak

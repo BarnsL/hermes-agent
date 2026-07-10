@@ -208,6 +208,16 @@ def atomic_json_write(
         raise
 
 
+# ─── CRITICAL ISSUE #1: PyYAML BOOTSTRAPPING DEADLOCK ─────────────────────
+# PROBLEM: This class definition runs at import time. If PyYAML is gutted
+#   (missing __init__.py, no SafeDumper), the ENTIRE CLI crashes before any
+#   command — including `hermes update` — can execute. The repair tool
+#   depends on the broken dependency. Classic bootstrapping deadlock.
+# IMPACT: `hermes update`, `hermes serve`, `hermes dashboard` ALL fail.
+# SOLUTION: `pip install --force-reinstall pyyaml==6.0.3` in the venv.
+# PREVENTION: A standalone `hermes-doctor` (stdlib-only) should exist.
+# See CRITICAL-ISSUES.md #1, ROOT-CAUSE-ANALYSIS.md S1.
+# ─────────────────────────────────────────────────────────────────────────
 class IndentDumper(yaml.SafeDumper):
     """PyYAML dumper that indents list items under mapping keys (2-space).
 

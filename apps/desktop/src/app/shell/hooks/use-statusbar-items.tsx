@@ -8,10 +8,11 @@ import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
-import { Activity, AlertCircle, Clock, Command, Hash, Loader2, Terminal, Zap, ZapFilled } from '@/lib/icons'
+import { Activity, AlertCircle, Clock, Command, Hash, Loader2, Terminal, Trash2, Zap, ZapFilled } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { cn } from '@/lib/utils'
+import { notify } from '@/store/notifications'
 import { setGlobalYolo, setSessionYolo } from '@/lib/yolo-session'
 import {
   $activeSessionId,
@@ -128,6 +129,31 @@ export function useStatusbarItems({
   )
 
   const showYoloToggle = gatewayState === 'open' && (!!activeSessionId || freshDraftReady)
+
+  // --- FEATURE #8 / CRITICAL #12: Clear Idle Sessions ---------------
+  // Calls `session.release_idle` JSON-RPC on the gateway to free idle
+  // sessions (>30 min idle, not busy, not focused). Prevents the session
+  // cap exhaustion that caused GIL pressure -> blank sessions (#12).
+  // Button: statusbar gateway menu, Trash2 icon.
+  // Backend: tui_gateway/server.py @method("session.release_idle")
+  // NOTE: Does NOT affect WS connection. If desktop stuck on
+  // "connecting", see CRITICAL #9 (asar/numpy/IPC cascade).
+  // -------------------------------------------------------------------
+  const clearIdleSessions = useCallback(async () => {
+    try {
+      const result = await requestGateway<{ released: number; skipped_busy: number }>(
+        'session.release_idle',
+        { idle_minutes: 30, current_session_id: activeSessionId ?? '' }
+      )
+      if (result.released > 0) {
+        notify({ kind: 'success', message: copy.sessionsReleased(result.released) })
+      } else {
+        notify({ kind: 'info', message: copy.noIdleToRelease })
+      }
+    } catch (err) {
+      notify({ kind: 'error', message: String(err instanceof Error ? err.message : err) })
+    }
+  }, [activeSessionId, copy.noIdleToRelease, copy.sessionsReleased, requestGateway])
 
   const gatewayMenuContent = useMemo(
     () => (close: () => void) => (
@@ -331,10 +357,19 @@ export function useStatusbarItems({
         title: copy.openCron,
         to: CRON_ROUTE,
         variant: 'action'
+      },
+      {
+        icon: <Trash2 className="size-3" />,
+        id: 'clear-idle',
+        label: copy.clearIdle,
+        onSelect: () => void clearIdleSessions(),
+        title: copy.clearIdleTitle,
+        variant: 'action'
       }
     ],
     [
       agentsOpen,
+      clearIdleSessions,
       commandCenterOpen,
       copy,
       gatewayMenuContent,

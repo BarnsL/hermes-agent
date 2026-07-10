@@ -183,6 +183,11 @@ async def _lifespan(app: "FastAPI"):
 
     # Fire hermes_cli.gateway import into a background thread so the event
     # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
+# ─── CRITICAL #10: If the loop IS blocked, check Windows Defender ──────
+# Defender scanning .pyc writes causes "event loop stalled N.Ns (GIL
+# pressure suspected)" warnings. The GIL is held during AV file I/O.
+# Fix: add venv path to Defender exclusions (see add-defender-exclusions.ps1).
+# ───────────────────────────────────────────────────────────────────────
     # On a cold Windows install the module chain triggers .pyc compilation
     # and Defender real-time scans that can stall the event loop for 15-30s.
     # Running in an executor means the cost is paid in a worker thread while
@@ -15356,6 +15361,20 @@ def start_server(
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
+            #
+            # ─── CRITICAL ISSUE #6/#8: READY-TOKEN PROTOCOL ─────────────────
+            # This line determines which token the backend prints to stdout.
+            # The desktop Electron app MUST match it via backend-ready.cjs.
+            #
+            # PROBLEM:
+            #   `hermes serve` (headless) prints `HERMES_BACKEND_READY` but the
+            #   packaged app.asar had a regex that only matched
+            #   `HERMES_DASHBOARD_READY`. Result: boot-loop / connecting-forever.
+            #
+            # SOLUTION:
+            #   backend-ready.cjs regex now matches BOTH tokens.
+            #   If you change this token name, update backend-ready.cjs too.
+            # ─────────────────────────────────────────────────────────────────
             ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
             print(f"{ready_token} port={actual_port}", flush=True)
             if headless:

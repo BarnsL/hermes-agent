@@ -39,6 +39,18 @@ from typing import Any, Dict, Optional, Tuple
 #: Time-to-live for newly-minted tickets in seconds. 30 s is long enough
 #: that the SPA can call ``getWsTicket()`` and immediately open the WS,
 #: short enough that a leaked ticket is uninteresting.
+#:
+#: ─── CRITICAL #9: TICKET EXPIRY DURING EVENT-LOOP STALL ───────────────
+#: If the backend event loop stalls for >30s (e.g. due to a broken numpy/torch
+#: import hogging the GIL, or a retry storm against an exhausted API key),
+#: tickets minted before the stall expire before the WS upgrade completes.
+#: The desktop UI then shows "connecting" indefinitely.
+#:
+#: This is NOT a ticketing bug — the TTL is correct for normal operation.
+#: The fix is to prevent event-loop stalls (see CRITICAL-ISSUES.md #9).
+#: If you see `TicketInvalid("expired")` in logs alongside `ws write slow`,
+#: the event loop is stalled, not the ticket system.
+#: ───────────────────────────────────────────────────────────────────────
 TTL_SECONDS = 30
 
 _lock = threading.Lock()

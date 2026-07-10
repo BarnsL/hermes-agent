@@ -3797,6 +3797,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key, model, runtime_kwargs
             )
 
+        # ─── RECURRING ISSUE R-6: "USAGE LIMIT REACHED" ON EVERY NEW SESSION ──
+        # SYMPTOM (2026-07-09 11:48, 12:22, 12:23): brand-new Discord sessions
+        #   died instantly with a plan usage-limit error and 0 tokens billed.
+        #   The gateway logged "No model configured — defaulting to
+        #   claude-fable-5 for provider anthropic" (the line below).
+        # ROOT CAUSE: this is a DOWNSTREAM symptom, not its own bug. Earlier that
+        #   morning config.yaml was corrupt (config.yaml.corrupt.20260709-110317,
+        #   ballooned 21KB→40KB). With no readable model.default, resolution fell
+        #   through to here, and the provider auto-resolved to `anthropic` because
+        #   the highest-priority pooled credential is the Claude Code OAuth token
+        #   (auth.json credential_pool.anthropic priority 0). So it silently
+        #   defaulted to the personal Claude SUBSCRIPTION, which was at its usage
+        #   cap → every new session failed on arrival.
+        # WHY THIS IS DANGEROUS: it fails OPEN onto the subscription. A corrupt
+        #   config (or an untrusted session that forces model resolution to miss)
+        #   drains the Claude plan and routes traffic onto a provider with
+        #   different retention semantics than the intended, opted-out DeepSeek.
+        # HARDENING (see RECURRING-ISSUES-AND-GAMEPLAN-2026-07-09.md G-4):
+        #   Prefer to FAIL CLOSED here — if the intended provider (deepseek) is
+        #   configured but unreadable, surface a loud "no model configured for
+        #   this session" error rather than quietly selecting the subscription.
+        #   Also validate config on load and fall back to a last-good copy so a
+        #   corrupt config never reaches this path. Do NOT let `anthropic` be the
+        #   silent default just because its OAuth token sits at pool priority 0.
+        # ──────────────────────────────────────────────────────────────────────
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
         # fall back to the provider's first catalog model so the API call
