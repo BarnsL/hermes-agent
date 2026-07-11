@@ -1,7 +1,7 @@
 import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { type FC, useCallback, useLayoutEffect, useRef, useState } from 'react'
+import { type FC, memo, useCallback, useLayoutEffect, useRef, useState } from 'react'
 
 import type { SessionInfo } from '@/hermes'
 import { type SidebarSessionEntry } from '@/lib/session-branch-tree'
@@ -92,13 +92,46 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   const [measureRetry, setMeasureRetry] = useState(0)
   const retriedRef = useRef(false)
 
+  const scrollMargin = sharedScroll ? sharedScrollMargin : 0
+
+  const virtualizer = useVirtualizer({
+    count: entries.length,
+    estimateSize: () => ROW_ESTIMATE_PX,
+    gap: ROW_GAP_PX,
+    getItemKey: index => entries[index]?.session.id ?? index,
+    getScrollElement: resolvedGetScrollElement,
+    // On scroll-element attach, virtual-core calls scrollToOffset with the
+    // current offset, which defaults to initialOffset = 0 — in shared-scroll
+    // mode that would yank the WHOLE sidebar to the top every time this list
+    // (re)mounts while scrolled (section reopen, search crossing the
+    // virtualization threshold). Seeding from the live scrollTop makes the
+    // attach a no-op. (Same trick useWindowVirtualizer uses with scrollY.)
+    initialOffset: () => resolvedGetScrollElement()?.scrollTop ?? 0,
+    // jsdom-friendly default; the real rect takes over on first observe.
+    initialRect: { height: 600, width: 240 },
+    overscan: OVERSCAN_ROWS,
+    scrollMargin
+  })
+
   // Intentionally no dep array: the offset depends on SIBLING layout
   // (pinned/categories above), not on any prop or state of this component, so
   // it must re-measure after every commit. The >=1px setState guard prevents
-  // an update loop.
+  // an update loop. (Declared after useVirtualizer so it can read
+  // virtualizer.isScrolling; run order vs. the virtualizer's internal attach
+  // effect doesn't matter — the first render uses scrollMargin 0 either way.)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useLayoutEffect(() => {
     if (!sharedScroll) {
+      return
+    }
+
+    // Content above this list cannot change height mid-scroll, and the range
+    // shifts during a wheel scroll land near every frame — each one a commit,
+    // and this effect's getBoundingClientRect reads a forced synchronous
+    // reflow of a dirty layout. Skip while scrolling; the isScrolling→false
+    // transition fires its own virtualizer notify/re-render, so the margin
+    // re-measures immediately after the scroll settles.
+    if (virtualizer.isScrolling) {
       return
     }
 
@@ -125,27 +158,6 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     setSharedScrollMargin(prev => (Math.abs(prev - margin) < 1 ? prev : margin))
   })
 
-  const scrollMargin = sharedScroll ? sharedScrollMargin : 0
-
-  const virtualizer = useVirtualizer({
-    count: entries.length,
-    estimateSize: () => ROW_ESTIMATE_PX,
-    gap: ROW_GAP_PX,
-    getItemKey: index => entries[index]?.session.id ?? index,
-    getScrollElement: resolvedGetScrollElement,
-    // On scroll-element attach, virtual-core calls scrollToOffset with the
-    // current offset, which defaults to initialOffset = 0 — in shared-scroll
-    // mode that would yank the WHOLE sidebar to the top every time this list
-    // (re)mounts while scrolled (section reopen, search crossing the
-    // virtualization threshold). Seeding from the live scrollTop makes the
-    // attach a no-op. (Same trick useWindowVirtualizer uses with scrollY.)
-    initialOffset: () => resolvedGetScrollElement()?.scrollTop ?? 0,
-    // jsdom-friendly default; the real rect takes over on first observe.
-    initialRect: { height: 600, width: 240 },
-    overscan: OVERSCAN_ROWS,
-    scrollMargin
-  })
-
   // Consume the retry counter so eslint keeps it and the re-render sticks.
   void measureRetry
 
@@ -158,6 +170,12 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   const paddingTop = Math.max(0, firstStart)
   const paddingBottom = Math.max(0, totalSize - lastEnd)
 
+  // Every prop handed to VirtualRow is a primitive or identity-stable across
+  // scroll-driven re-renders (the list handlers are prop-drilled and stable,
+  // measureElement is a stable method on the virtualizer instance, and entry
+  // objects keep identity while `entries` does), so React.memo bails out for
+  // every already-mounted row during a scroll — the per-id closures are built
+  // inside VirtualRow instead of here, where they'd defeat the memo.
   const rows = virtualItems.map(virtualItem => {
     const entry = entries[virtualItem.index]
 
@@ -165,37 +183,23 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       return null
     }
 
-    const { branchStem, session } = entry
-    const reorderable = sortable && !branchStem
+    const { session } = entry
 
-    const commonProps: SessionRowCommonProps = {
-      branchStem,
-      isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      isWorking: workingSessionIdSet.has(session.id),
-      onArchive: () => onArchiveSession(session.id),
-      onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-      onDelete: () => onDeleteSession(session.id),
-      onPin: () => onTogglePin(sessionPinId(session)),
-      onResume: () => onResumeSession(session.id),
-      reorderable
-    }
-
-    return reorderable ? (
-      <VirtualSortableRow
+    return (
+      <VirtualRow
+        entry={entry}
         index={virtualItem.index}
+        isSelected={session.id === activeSessionId}
+        isWorking={workingSessionIdSet.has(session.id)}
         key={session.id}
         measureRef={virtualizer.measureElement}
-        rowProps={commonProps}
-        session={session}
-      />
-    ) : (
-      <SidebarSessionRow
-        {...commonProps}
-        data-index={virtualItem.index}
-        key={session.id}
-        ref={virtualizer.measureElement}
-        session={session}
+        onArchiveSession={onArchiveSession}
+        onBranchSession={onBranchSession}
+        onDeleteSession={onDeleteSession}
+        onResumeSession={onResumeSession}
+        onTogglePin={onTogglePin}
+        pinned={pinned}
+        sortable={sortable}
       />
     )
   })
@@ -235,6 +239,64 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     </div>
   )
 }
+
+interface VirtualRowProps {
+  entry: SidebarSessionEntry
+  index: number
+  isSelected: boolean
+  isWorking: boolean
+  measureRef: (node: Element | null) => void
+  onArchiveSession: (sessionId: string) => void
+  onBranchSession?: (sessionId: string, profile?: string) => void
+  onDeleteSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string) => void
+  onTogglePin: (sessionId: string) => void
+  pinned: boolean
+  sortable: boolean
+}
+
+// Memoized scroll-bail-out wrapper: virtual-core notifies on every visible
+// range / isScrolling change (near every frame on a fast wheel scroll), and
+// each notify re-renders VirtualSessionList. Building the row closures here —
+// behind the memo — keeps those re-renders from cascading into all ~visible+
+// overscan SidebarSessionRows (each with Radix menu/tooltip trees to
+// reconcile). Only rows whose primitive props actually changed re-render.
+const VirtualRow = memo(function VirtualRow({
+  entry,
+  index,
+  isSelected,
+  isWorking,
+  measureRef,
+  onArchiveSession,
+  onBranchSession,
+  onDeleteSession,
+  onResumeSession,
+  onTogglePin,
+  pinned,
+  sortable
+}: VirtualRowProps) {
+  const { branchStem, session } = entry
+  const reorderable = sortable && !branchStem
+
+  const commonProps: SessionRowCommonProps = {
+    branchStem,
+    isPinned: pinned,
+    isSelected,
+    isWorking,
+    onArchive: () => onArchiveSession(session.id),
+    onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
+    onDelete: () => onDeleteSession(session.id),
+    onPin: () => onTogglePin(sessionPinId(session)),
+    onResume: () => onResumeSession(session.id),
+    reorderable
+  }
+
+  return reorderable ? (
+    <VirtualSortableRow index={index} measureRef={measureRef} rowProps={commonProps} session={session} />
+  ) : (
+    <SidebarSessionRow {...commonProps} data-index={index} ref={measureRef} session={session} />
+  )
+})
 
 interface VirtualSortableRowProps {
   index: number
