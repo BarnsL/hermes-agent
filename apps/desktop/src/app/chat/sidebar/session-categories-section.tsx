@@ -1,4 +1,3 @@
-import { useStore } from '@nanostores/react'
 import { useState } from 'react'
 import type * as React from 'react'
 
@@ -8,12 +7,12 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Input } from '@/components/ui/input'
 import type { SessionInfo } from '@/hermes'
 import {
-  $sessionCategories,
   createCategory,
   deleteCategory,
   moveSessionToCategory,
   removeSessionFromCategory,
   renameCategory,
+  type SessionCategory,
   toggleCategoryCollapsed,
 } from '@/store/layout'
 import { pinSession } from '@/store/layout'
@@ -23,6 +22,7 @@ import { SidebarSessionsSection } from './sessions-section'
 
 export function SessionCategoriesSection({
   activeSessionId,
+  categories,
   sessionById,
   workingSessionIdSet,
   onArchiveSession,
@@ -31,6 +31,11 @@ export function SessionCategoriesSection({
   onResumeSession,
 }: {
   activeSessionId: string | null
+  // Passed down from ChatSidebar (which owns the $sessionCategories
+  // subscription) instead of subscribing here: the virtualized recents list
+  // below re-measures its shared-scroll offset per commit of the sidebar
+  // tree, so category height changes MUST re-render that tree (CRITICAL #15).
+  categories: SessionCategory[]
   sessionById: Map<string, SessionInfo>
   workingSessionIdSet: Set<string>
   onArchiveSession: (id: string) => void
@@ -38,8 +43,6 @@ export function SessionCategoriesSection({
   onDeleteSession: (id: string) => void
   onResumeSession: (id: string) => void
 }) {
-  const categories = useStore($sessionCategories)
-
   if (categories.length === 0) {
     return (
       <div className="shrink-0 px-2 pb-1">

@@ -225,12 +225,23 @@ export function SidebarSessionsSection({
   const renderRows = (items: SessionInfo[]) =>
     flattenSessionsWithBranches(items).map(({ branchStem, session }) => renderRow(session, false, branchStem))
 
+  // ─── CRITICAL ISSUE #15 (2026-07-09): virtualize ONLY in shared-scroll mode.
+  // Without an external scroll element the virtual list nests its OWN scroll
+  // container inside the sidebar's scroller; that inner scroller (which grows
+  // to content height, so it can never actually scroll) latched wheel events
+  // and — with overscroll-contain — refused to chain them outward. Result:
+  // wheel was dead over session rows and only worked on the scrollbar track.
+  // This predicate previously disagreed with the caller's `recentsVirtualizes`
+  // (it ignored categories), which is exactly how the nested scroller slipped
+  // in. Now the caller opts in by passing getScrollElement, and a long list
+  // without one simply renders flat. See CRITICAL-ISSUES.md #15.
   const flatVirtualized =
     !showEmptyState &&
     !groups?.length &&
     !projectOverview?.length &&
     !projectContent &&
-    sessions.length >= VIRTUALIZE_THRESHOLD
+    sessions.length >= VIRTUALIZE_THRESHOLD &&
+    Boolean(getScrollElement)
 
   // First paint into the grouped view (e.g. the app restoring the Projects tab)
   // has flat recents in `sessions` but no tree yet. Show skeletons rather than
@@ -343,9 +354,12 @@ export function SidebarSessionsSection({
     inner = displayEntries.map(({ branchStem, session }) => renderRow(session, false, branchStem))
   }
 
-  // The virtualizer owns its own scroller, so suppress the wrapper's overflow
-  // to avoid a double scroll container.
-  const resolvedContentClassName = cn(contentClassName, flatVirtualized && 'overflow-y-visible')
+  // flatVirtualized implies shared-scroll mode (see the predicate above): the
+  // virtualizer NEVER owns a scroller here, so the wrapper needs no overflow
+  // suppression. Do not add per-axis overflow classes to this wrapper — a
+  // single-axis overflow forces the other axis from `visible` to `auto` and
+  // silently recreates the nested scroll container of CRITICAL #15.
+  const resolvedContentClassName = contentClassName
 
   return (
     <SidebarGroup className={rootClassName}>

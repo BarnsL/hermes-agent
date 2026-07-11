@@ -149,25 +149,53 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
   { id: 'artifacts', label: '', icon: props => <Codicon name="files" {...props} />, route: ARTIFACTS_ROUTE }
 ]
 
-// Two modes via the `compact` height variant (styles.css):
-//   tall    → each section is shrink-0, capped, its own scroller; Sessions is flex-1.
-//   compact → COMPACT_FLAT drops the caps so the whole stack scrolls as one.
-// Sections stay shrink-0 so none can be squeezed below its content and bleed onto
-// the next — the flexbox `min-height: auto` overlap trap that caused the bug.
+// Scroll architecture (post CRITICAL #15): ONE shared scroll container (the
+// SCROLL_Y div below) owns all session-stack scrolling in both height modes.
+// Sections are shrink-0 (never flex-squeezed below content — the
+// `min-height: auto` overlap trap). In tall mode, pinned/messaging bodies are
+// max-h capped with their own small chainable scrollers (GROUP_BODY); in
+// compact mode COMPACT_FLAT drops those caps so the whole stack is one flat
+// scroll.
 const COMPACT_FLAT = 'compact:max-h-none compact:overflow-visible'
 
-// Vertical scroll only — never a horizontal bar from glow bleed, long titles, etc.
-// overflow-y-scroll (not auto): forces Chromium/Electron to always treat this as
-// a scroll container. With overflow-y-auto, wheel events on child elements
-// (session rows) sometimes fail to bubble to the scroll container — scrolling
-// only works when the cursor is directly on the scrollbar track. 'scroll' fixes
-// the hit-test so wheel events always reach the right element.
-const SCROLL_Y = 'overflow-y-scroll overflow-x-hidden'
+// ─── CRITICAL ISSUE #15 (2026-07-09): SIDEBAR WHEEL-SCROLL DEAD ZONES ────────
+// PROBLEM:
+//   Wheel scrolling was dead anywhere over session rows; only the scrollbar
+//   track scrolled the panel. Two prior "fixes" (overflow-y-scroll and a
+//   manual native wheel listener that set scrollTop directly) treated the
+//   symptom, not the cause — the listener was attached once ([] deps) to a
+//   conditionally-mounted div: any remount of that div while ChatSidebar
+//   stayed mounted (blank state → first session, empty-profile switch,
+//   boot-failure reconnect) detached it permanently, and a pane collapse left
+//   it missing for the whole hover-reveal period. Its
+//   preventDefault()-on-every-tick also killed compositor-threaded scrolling
+//   (main-thread scroll = the jank the user felt).
+// ROOT CAUSE:
+//   VirtualSessionList nested its OWN scroll container (overflow-y-auto +
+//   overscroll-contain) inside this one whenever `flatVirtualized` disagreed
+//   with `recentsVirtualizes` (e.g. categories present + ≥25 sessions). The
+//   inner scroller grows to its content height so it can never scroll, but
+//   Chromium still latches wheel events to it, and overscroll-contain stops
+//   the scroll chain there. Dead zone over every virtualized row.
+// SOLUTION:
+//   One scroll container — this one. VirtualSessionList never owns a scroller
+//   inside the sidebar (it gets getScrollElement + a measured scrollMargin),
+//   overscroll-contain is gone from shared mode, and the manual wheel hack is
+//   deleted. Native, compositor-driven scrolling everywhere, smooth again.
+//   See CRITICAL-ISSUES.md #15 / ROOT-CAUSE-ANALYSIS.md.
+// ─────────────────────────────────────────────────────────────────────────────
+// Vertical scroll only — never a horizontal bar from glow bleed, long titles,
+// etc. scrollbar-gutter keeps the width stable as the scrollbar comes and goes
+// (matches master-detail.tsx / mcp-tab.tsx).
+const SCROLL_Y = 'overflow-y-auto overflow-x-hidden [scrollbar-gutter:stable]'
 
-// A non-session group's scroll body: capped at max-height, clipped (no own
-// scroll — the shared outer container handles all scrolling). overflow-hidden
-// prevents content from spilling out of the max-h cap.
-const GROUP_BODY = cn('overflow-hidden', COMPACT_FLAT)
+// A capped group body (pinned, messaging): max-h capped with its OWN small
+// scroller so rows beyond the cap stay reachable (overflow-hidden used to
+// clip them out of existence — pre-#15 flaw). Deliberately NO
+// overscroll-contain: when this box is at its scroll edge (or too short to
+// scroll), the wheel chains outward to the shared sidebar scroller instead of
+// dying here (CRITICAL #15). Compact mode drops the cap entirely.
+const GROUP_BODY = cn('overflow-x-hidden overflow-y-auto', COMPACT_FLAT)
 
 // Section-header action icons stay hidden until the whole header row is hovered
 // (group/section lives on SidebarSectionHeader), mirroring the artifacts/file
@@ -252,6 +280,12 @@ export function ChatSidebar({
   const sessions = useStore($sessions)
   const cronSessions = useStore($cronSessions)
   const cronJobs = useStore($cronJobs)
+  // Subscribed HERE (not only inside SessionCategoriesSection) on purpose:
+  // category expand/collapse changes the height of content ABOVE the
+  // virtualized recents list, and the virtualizer's scrollMargin re-measures
+  // per commit of THIS tree. If only the sibling subtree re-rendered, the
+  // margin would go stale and rows would blank out (CRITICAL #15 caveat found
+  // in review). Categories flow down as a prop so the data path is explicit.
   const sessionCategories = useStore($sessionCategories)
   const messagingSessions = useStore($messagingSessions)
   const messagingPlatformTotals = useStore($messagingPlatformTotals)
@@ -295,27 +329,18 @@ export function ChatSidebar({
   // Per-platform count of rows currently revealed (starts at NON_SESSION_INITIAL_ROWS).
   const [messagingVisible, setMessagingVisible] = useState<Record<string, number>>({})
   const searchInputRef = useRef<HTMLInputElement>(null)
+  // The single scroll container for the whole session stack (search results,
+  // pinned, categories, recents). Also handed to the virtualizer via
+  // getScrollElement so virtualized recents scroll in the same surface.
+  //
+  // CRITICAL #15: a manual native `wheel` listener used to live here, setting
+  // scrollTop by hand ("Electron fails to route wheel events"). That diagnosis
+  // was wrong — the real cause was a nested scroller + overscroll-contain in
+  // VirtualSessionList — and the hack itself was racy (attached once to a
+  // conditionally-mounted div) and disabled smooth compositor scrolling. Do
+  // NOT reintroduce it; fix scroll-chain problems at the container that eats
+  // the event instead.
   const scrollContainerRef = useRef<HTMLDivElement>(null)
-
-  // Native wheel listener: Electron/Chromium fails to route wheel events from
-  // child elements (session rows) to the scroll container. This manually sets
-  // scrollTop, bypassing Chromium's event routing entirely.
-  useEffect(() => {
-    const el = scrollContainerRef.current
-
-    if (!el) {
-      return
-    }
-
-    const onWheel = (e: WheelEvent) => {
-      el.scrollTop += e.deltaY
-      e.preventDefault()
-    }
-
-    el.addEventListener('wheel', onWheel, { passive: false })
-
-    return () => el.removeEventListener('wheel', onWheel)
-  }, [])
 
   const trimmedQuery = searchQuery.trim()
 
@@ -543,17 +568,29 @@ export function ChatSidebar({
     }
 
     let lastScanAt = 0
+    let lastRefreshAt = 0
     const SCAN_THROTTLE_MS = 30_000
+    // A single refocus fires BOTH 'focus' and 'visibilitychange'; without this
+    // guard every alt-tab back ran the tree refresh twice back-to-back (and
+    // each unguarded refresh cascades into per-repo git probes). One refresh
+    // per activation is plenty (perf finding, 2026-07-09).
+    const REFRESH_DEDUPE_MS = 1_000
 
     const onActive = () => {
       if (document.visibilityState === 'hidden') {
         return
       }
 
+      const now = Date.now()
+
+      if (now - lastRefreshAt < REFRESH_DEDUPE_MS) {
+        return
+      }
+
+      lastRefreshAt = now
+
       void refreshProjects()
       void refreshProjectTree()
-
-      const now = Date.now()
 
       if (now - lastScanAt >= SCAN_THROTTLE_MS) {
         lastScanAt = now
@@ -1004,17 +1041,18 @@ export function ChatSidebar({
     [agentProjectTree]
   )
 
-  // Virtualization creates its own scroll container which breaks unified
-  // scrolling when categories are present. Disable it whenever categories
-  // exist so all sections scroll together in the shared container.
+  // Long flat recents virtualize INSIDE the shared scroll container (the
+  // virtualizer gets our scroll element + a measured scrollMargin, so content
+  // above — pinned, categories — no longer breaks its math). Categories used
+  // to disable virtualization entirely as a scroll-unification workaround
+  // (CRITICAL #15); with the shared-scroll offset handled, big session lists
+  // stay virtualized (~30 DOM rows) even when categories exist.
   const recentsVirtualizes =
-    sessionCategories.length === 0 &&
     !displayAgentGroups?.length &&
     !agentProjectTree?.length &&
     displayAgentSessions.length >= VIRTUALIZE_THRESHOLD
 
-  // When Recents virtualizes inside the shared scroll container, give the
-  // virtualizer our outer scroll element so all sections scroll together.
+  // The one scroll element shared by every section (and the virtualizer).
   const getScrollElement = useCallback(
     () => scrollContainerRef.current,
     []
@@ -1173,7 +1211,12 @@ export function ChatSidebar({
             {trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
-                contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y)}
+                // No nested SCROLL_Y here (CRITICAL #15): the outer container
+                // is the only scroller; long result lists virtualize into it
+                // via getScrollElement. The root must be shrink-0 and NOT
+                // overflow-hidden, or the flexbox squeezes the section to its
+                // min-height and clips results out of reach.
+                contentClassName="flex flex-col gap-px pb-1.75"
                 emptyState={
                   searchPending ? (
                     <SidebarSessionSkeletons />
@@ -1183,6 +1226,7 @@ export function ChatSidebar({
                     </div>
                   )
                 }
+                getScrollElement={getScrollElement}
                 label={s.results}
                 labelMeta={String(searchResults.length)}
                 onArchiveSession={onArchiveSession}
@@ -1193,7 +1237,7 @@ export function ChatSidebar({
                 onTogglePin={pinSession}
                 open
                 pinned={false}
-                rootClassName="min-h-32 overflow-hidden p-0"
+                rootClassName="min-h-32 shrink-0 p-0"
                 sessions={searchResults}
                 workingSessionIdSet={workingSessionIdSet}
               />
@@ -1225,6 +1269,7 @@ export function ChatSidebar({
             {!trimmedQuery && (
               <SessionCategoriesSection
                 activeSessionId={activeSidebarSessionId}
+                categories={sessionCategories}
                 onArchiveSession={onArchiveSession}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
@@ -1374,7 +1419,10 @@ export function ChatSidebar({
                 projectRepoWorktrees={inProject ? scopedRepoWorktrees : undefined}
                 projectsLoading={worktreeGroupingActive ? projectTreeLoading : false}
                 removedSessionIds={inProject ? removedSessionIds : undefined}
-                rootClassName="min-h-32 p-0"
+                // shrink-0: sections in the shared scroller must never be
+                // flex-squeezed below their content (CRITICAL #15) — the outer
+                // container scrolls; sections just take their natural height.
+                rootClassName="min-h-32 shrink-0 p-0"
                 sessions={displayAgentSessions}
                 sortable={!showAllProfiles && agentSessions.length > 1}
                 workingSessionIdSet={workingSessionIdSet}

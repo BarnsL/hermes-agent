@@ -19,7 +19,15 @@ export interface SessionDragPayload {
 
 export function writeSessionDrag(transfer: DataTransfer, payload: SessionDragPayload) {
   transfer.setData(HERMES_SESSION_MIME, JSON.stringify(payload))
-  transfer.effectAllowed = 'copy'
+  // ─── CRITICAL ISSUE #16 (2026-07-09): effectAllowed must cover EVERY drop
+  // target's dropEffect. This was 'copy', but the sidebar category drop zones
+  // set dropEffect='move' — and per the HTML DnD spec, Chromium cancels a drop
+  // whose dropEffect isn't permitted by effectAllowed. Result: dragging a
+  // session onto a category showed a no-drop cursor and the drop event never
+  // fired, with zero errors anywhere. 'copyMove' allows both the composer/chat
+  // targets ('copy') and the category targets ('move').
+  // See CRITICAL-ISSUES.md #16.
+  transfer.effectAllowed = 'copyMove'
 }
 
 export function dragHasSession(transfer: DataTransfer | null) {
