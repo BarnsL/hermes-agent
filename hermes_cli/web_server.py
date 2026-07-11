@@ -8081,23 +8081,29 @@ def _open_session_db_for_profile(profile: Optional[str]):
 
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        session = db.get_session(sid) if sid else None
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        if profile:
-            session["profile"] = _cron_profile_home(profile)[0]
-        return session
-    finally:
-        db.close()
+    # Blocking SQLite read — offload off the event loop (see the /messages route
+    # above for the full RESUME-PERF rationale; same loop-stall class).
+    def _read():
+        db = _open_session_db_for_profile(profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            session = db.get_session(sid) if sid else None
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if profile:
+                session["profile"] = _cron_profile_home(profile)[0]
+            return session
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_read)
 
 
 
 @app.get("/api/sessions/{session_id}/latest-descendant")
 async def get_session_latest_descendant(session_id: str):
-    latest, path = _session_latest_descendant(session_id)
+    # _session_latest_descendant walks the lineage in SQLite — offload off-loop.
+    latest, path = await asyncio.to_thread(_session_latest_descendant, session_id)
     if not latest:
         raise HTTPException(status_code=404, detail="Session not found")
     return {
@@ -8109,16 +8115,27 @@ async def get_session_latest_descendant(session_id: str):
 
 @app.get("/api/sessions/{session_id}/messages")
 async def get_session_messages(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        if not sid:
-            raise HTTPException(status_code=404, detail="Session not found")
-        sid = db.resolve_resume_session_id(sid)
-        messages = db.get_messages(sid)
-        return {"session_id": sid, "messages": messages}
-    finally:
-        db.close()
+    # ─── RESUME PERF (RCA 2026-07-09, CRITICAL #12): OFFLOAD OFF THE LOOP ──────
+    # The body is a blocking, whole-history SQLite read + per-message decode. As
+    # an `async def` route it runs ON the uvicorn event loop, so opening a big
+    # session (1.5 MB / ~2000 msgs) parked the loop ~28s ("event loop stalled …s
+    # (GIL pressure suspected)"), which blocked the concurrent WS `session.resume`
+    # from flushing its frame and blew BOTH the 15s REST and 30s WS deadlines →
+    # blank chat. Running the whole blocking sequence in a worker thread keeps the
+    # loop free so WS frames flush and neither deadline is starved by a stall.
+    def _read():
+        db = _open_session_db_for_profile(profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Session not found")
+            sid = db.resolve_resume_session_id(sid)
+            messages = db.get_messages(sid)
+            return {"session_id": sid, "messages": messages}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_read)
 
 
 @app.delete("/api/sessions/{session_id}")

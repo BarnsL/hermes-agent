@@ -297,7 +297,14 @@ export function getSessionMessages(id: string, profile?: string | null): Promise
 
   return window.hermesDesktop.api<SessionMessagesResponse>({
     ...(profile ? { profile } : {}),
-    path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
+    path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`,
+    // RESUME PERF (RCA 2026-07-09): this is the transcript read used to paint a
+    // resumed chat. A big session (1.5 MB / ~2000 msgs) can legitimately take
+    // >15s to read+decode even now that the backend runs it off the event loop
+    // (web_server.py get_session_messages). The default 15s fetch budget aborted
+    // it mid-flight → blank chat. Give it the same 60s budget as session lists so
+    // a slow-but-alive read finishes instead of being killed.
+    timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 }
 
