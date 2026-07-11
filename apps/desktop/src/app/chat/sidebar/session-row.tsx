@@ -132,12 +132,6 @@ export function SidebarSessionRow({
         )}
         data-working={isWorking ? 'true' : undefined}
         draggable
-        onDragEnd={event => {
-          // dropEffect after the gesture is the browser's verdict: 'none'
-          // means no target accepted the drop; 'move' means our category zone
-          // took it. Temporary diagnostic, same rationale as above.
-          console.error('[dnd] session drag end', session.id, 'dropEffect=', event.dataTransfer?.dropEffect)
-        }}
         onDragStart={event => {
           // Reorder drags belong to dnd-kit (the grab handle) — cancel the
           // native drag so the two DnD systems don't fight.
@@ -147,17 +141,16 @@ export function SidebarSessionRow({
             return
           }
 
+          // NOTE (CRITICAL #16b): on this machine the OS drag loop dies right
+          // after dragstart, so this native path may go nowhere — the pointer
+          // fallback below (onPointerDown → session-pointer-drag.ts) is what
+          // actually delivers drag-to-category here. Both stay wired: the
+          // native path serves healthy machines and the composer drop target.
           writeSessionDrag(event.dataTransfer, {
             id: session.id,
             profile: session.profile || 'default',
             title
           })
-          // Diagnostic breadcrumb (CRITICAL #16 follow-up): console.error on
-          // purpose — main.cjs mirrors ONLY error-level renderer console lines
-          // into desktop.log (console-message handler: `level !== 3 return`),
-          // so info/debug logs are invisible there. Remove once drag-to-
-          // category is confirmed on the user's machine.
-          console.error('[dnd] session drag start', session.id, (event.target as HTMLElement).tagName)
         }}
         ref={ref}
         style={style}

@@ -164,7 +164,9 @@ function endDrag(commit: boolean, x?: number, y?: number) {
       const hit = zoneAt(x, y)
 
       if (hit) {
-        console.error('[dnd] pointer-fallback drop', state.payload.id, '→', hit.id)
+        // info level: visible in devtools for future debugging, but NOT
+        // mirrored into desktop.log (main.cjs only mirrors error level).
+        console.info('[dnd] pointer-fallback drop', state.payload.id, '→', hit.id)
         hit.zone.onDrop(state.payload)
       }
     }
@@ -211,7 +213,7 @@ export function startSessionPointerTracking(event: React.PointerEvent, payload: 
       // Native drag never engaged (its loop freezes pointermove) — take over.
       state.dragging = true
       state.ghost = makeGhost(payload.title)
-      console.error('[dnd] pointer-fallback drag engaged', payload.id)
+      console.info('[dnd] pointer-fallback drag engaged', payload.id)
     }
 
     if (state.ghost) {
