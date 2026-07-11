@@ -1,8 +1,10 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type * as React from 'react'
 
 import { dragHasSession, readSessionDrag } from '@/app/chat/composer/inline-refs'
 import { cn } from '@/lib/utils'
+
+import { registerPointerDropZone } from './session-pointer-drag'
 
 /**
  * Droppable wrapper for session categories.
@@ -43,6 +45,25 @@ export function CategoryDropZone({
   // dragenter/dragleave fire for every descendant crossed; a depth counter is
   // the standard way to know when the pointer has truly left the zone.
   const depth = useRef(0)
+  const zoneRef = useRef<HTMLDivElement | null>(null)
+
+  // Also accept the pointer-events fallback drag (CRITICAL #16b): on machines
+  // where the OS drag loop dies instantly (remote/virtual input drivers), the
+  // HTML5 handlers below never fire. The registry drives the SAME isOver
+  // highlight and the same drop action.
+  useEffect(() => {
+    const el = zoneRef.current
+
+    if (!el) {
+      return
+    }
+
+    return registerPointerDropZone(categoryId, {
+      element: el,
+      onDrop: payload => onDropSession(payload.id, categoryId),
+      setIsOver
+    })
+  }, [categoryId, onDropSession])
 
   const reset = () => {
     depth.current = 0
@@ -124,6 +145,7 @@ export function CategoryDropZone({
       onDragLeave={handleDragLeave}
       onDragOver={handleDragOver}
       onDrop={handleDrop}
+      ref={zoneRef}
     >
       {children}
     </div>

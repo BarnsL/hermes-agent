@@ -18,6 +18,7 @@ import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
+import { consumePointerDragClick, startSessionPointerTracking } from './session-pointer-drag'
 
 interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   session: SessionInfo
@@ -171,6 +172,15 @@ export function SidebarSessionRow({
           // the shell's onDragStart above (CRITICAL #16 hardening).
           draggable
           onClick={event => {
+            // A pointer-fallback drag just ended on this press — swallow the
+            // click so the drop doesn't also resume the session.
+            if (consumePointerDragClick()) {
+              event.preventDefault()
+              event.stopPropagation()
+
+              return
+            }
+
             if (event.shiftKey) {
               event.preventDefault()
               event.stopPropagation()
@@ -195,6 +205,16 @@ export function SidebarSessionRow({
 
             onResume()
           }}
+          onPointerDown={event =>
+            // CRITICAL #16b: pointer-events fallback for machines where the
+            // OS drag loop dies (see session-pointer-drag.ts). Dormant when
+            // native HTML5 drag works.
+            startSessionPointerTracking(event, {
+              id: session.id,
+              profile: session.profile || 'default',
+              title
+            })
+          }
         >
           {reorderable ? (
             <SidebarRowGrab
