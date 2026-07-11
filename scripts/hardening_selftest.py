@@ -139,6 +139,23 @@ def test_g4_no_star_resurrect_when_failed_closed() -> None:
            f"new+guard={a} new+noguard={b} own+guard={c}")
 
 
+def test_sakana_provider_registered() -> None:
+    """Sakana AI provider is a first-class, code-backed provider (not cache-only),
+    and its non-interactive default is the cheap `fugu`, never the $5/$30 ultra."""
+    from hermes_cli import providers as P, models as M, auth as A
+    pd = P.get_provider("sakana")
+    ok = (
+        pd is not None
+        and pd.base_url == "https://api.sakana.ai/v1"
+        and "SAKANA_API_KEY" in pd.api_key_env_vars
+        and "sakana" in A.PROVIDER_REGISTRY
+        and M.get_default_model_for_provider("sakana") == "fugu"
+        and "fugu" in M._PROVIDER_MODELS.get("sakana", [])
+    )
+    record("Sakana provider registered (default=fugu)", ok,
+           f"base={getattr(pd,'base_url',None)} default={M.get_default_model_for_provider('sakana')}")
+
+
 def test_g6_vision_guard_predicate() -> None:
     """G-6/R-4: helper reports DeepSeek text model as non-vision (guard fires)."""
     try:
@@ -164,7 +181,8 @@ def main() -> int:
     for t in (test_g2_pkg_guard_hash_refusal, test_g2_unhashed_refused_by_default,
               test_g4_lastgood_config, test_g4_modelless_not_captured,
               test_g4_no_star_resurrect_when_failed_closed,
-              test_g5_tencentdb_windows_guard, test_g6_vision_guard_predicate):
+              test_g5_tencentdb_windows_guard, test_sakana_provider_registered,
+              test_g6_vision_guard_predicate):
         try:
             t()
         except Exception as e:  # noqa: BLE001

@@ -349,6 +349,18 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("DEEPSEEK_API_KEY",),
         base_url_env_var="DEEPSEEK_BASE_URL",
     ),
+    # Sakana AI "Fugu" — OpenAI-compatible (Chat Completions + Responses).
+    # Also present in the models.dev catalog (id=sakana); registered here so the
+    # credential pool detects SAKANA_API_KEY and it is a first-class provider
+    # even if the models.dev cache is ever cleared. Added 2026-07-09.
+    "sakana": ProviderConfig(
+        id="sakana",
+        name="Sakana AI",
+        auth_type="api_key",
+        inference_base_url="https://api.sakana.ai/v1",
+        api_key_env_vars=("SAKANA_API_KEY",),
+        base_url_env_var="SAKANA_BASE_URL",
+    ),
     "xai": ProviderConfig(
         id="xai",
         name="xAI",

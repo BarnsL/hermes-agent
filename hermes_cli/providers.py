@@ -134,6 +134,14 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         base_url_env_var="DEEPSEEK_BASE_URL",
     ),
+    # Sakana AI Fugu — OpenAI-compatible chat. models.dev already carries the
+    # catalog (base url + models); this overlay pins transport + base url so the
+    # provider still resolves if the models.dev cache is unavailable. 2026-07-09.
+    "sakana": HermesOverlay(
+        transport="openai_chat",
+        base_url_override="https://api.sakana.ai/v1",
+        base_url_env_var="SAKANA_BASE_URL",
+    ),
     "alibaba": HermesOverlay(
         transport="openai_chat",
         base_url_env_var="DASHSCOPE_BASE_URL",

@@ -346,6 +346,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
+        "claude-sonnet-5",
         "claude-sonnet-4-6",
         "claude-opus-4-5-20251101",
         "claude-sonnet-4-5-20250929",
@@ -358,6 +359,14 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek-v4-flash",
         "deepseek-chat",
         "deepseek-reasoner",
+    ],
+    # Sakana AI Fugu (added 2026-07-09). `fugu` FIRST so the non-interactive
+    # default is the cheap/low-latency model, not the $5/$30 fugu-ultra. See
+    # _PROVIDER_SILENT_DEFAULT_OVERRIDES below for the belt-and-suspenders guard.
+    "sakana": [
+        "fugu",
+        "fugu-ultra",
+        "fugu-ultra-20260615",
     ],
     "xiaomi": [
         "mimo-v2.5-pro",
@@ -1293,6 +1302,11 @@ _PROVIDER_ALIASES = {
 # hit the Portal; this fallback must stay cheap and network-free.
 _PROVIDER_SILENT_DEFAULT_OVERRIDES: dict[str, str] = {
     "nous": "deepseek/deepseek-v4-flash",
+    # A missing sakana model must never silently escalate to the $5/$30
+    # fugu-ultra flagship. `fugu` is already first in _PROVIDER_MODELS, but pin
+    # it here too so the "most-capable-first" convention can't reorder into a
+    # billing footgun (mirrors the get_default_model_for_provider contract).
+    "sakana": "fugu",
 }
 
 
