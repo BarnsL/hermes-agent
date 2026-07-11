@@ -344,6 +344,34 @@ export function ChatSidebar({
 
   const trimmedQuery = searchQuery.trim()
 
+  // ── TEMPORARY DIAGNOSTIC (CRITICAL #16 follow-up, 2026-07-10) ─────────────
+  // Capture-phase window listeners see every native DnD event regardless of
+  // React handlers or stopPropagation. console.error on purpose: main.cjs
+  // mirrors only error-level renderer console lines into desktop.log. Remove
+  // once drag-to-category is confirmed working on the user's machine.
+  useEffect(() => {
+    const log = (e: DragEvent) =>
+      console.error(
+        '[dnd] window',
+        e.type,
+        (e.target as HTMLElement | null)?.tagName ?? '?',
+        [...(e.dataTransfer?.types ?? [])].join('|') || 'no-types'
+      )
+
+    const types = ['dragstart', 'dragend', 'drop'] as const
+
+    for (const t of types) {
+      window.addEventListener(t, log, true)
+    }
+
+    return () => {
+      for (const t of types) {
+        window.removeEventListener(t, log, true)
+      }
+    }
+  }, [])
+  // ── END TEMPORARY DIAGNOSTIC ──────────────────────────────────────────────
+
   // Hotkey (session.focusSearch) → focus the field once it's mounted.
   useEffect(() => {
     const onFocus = () => searchInputRef.current?.focus({ preventScroll: true })

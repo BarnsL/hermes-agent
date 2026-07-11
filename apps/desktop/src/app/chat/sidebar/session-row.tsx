@@ -131,6 +131,12 @@ export function SidebarSessionRow({
         )}
         data-working={isWorking ? 'true' : undefined}
         draggable
+        onDragEnd={event => {
+          // dropEffect after the gesture is the browser's verdict: 'none'
+          // means no target accepted the drop; 'move' means our category zone
+          // took it. Temporary diagnostic, same rationale as above.
+          console.error('[dnd] session drag end', session.id, 'dropEffect=', event.dataTransfer?.dropEffect)
+        }}
         onDragStart={event => {
           // Reorder drags belong to dnd-kit (the grab handle) — cancel the
           // native drag so the two DnD systems don't fight.
@@ -145,6 +151,12 @@ export function SidebarSessionRow({
             profile: session.profile || 'default',
             title
           })
+          // Diagnostic breadcrumb (CRITICAL #16 follow-up): console.error on
+          // purpose — main.cjs mirrors ONLY error-level renderer console lines
+          // into desktop.log (console-message handler: `level !== 3 return`),
+          // so info/debug logs are invisible there. Remove once drag-to-
+          // category is confirmed on the user's machine.
+          console.error('[dnd] session drag start', session.id, (event.target as HTMLElement).tagName)
         }}
         ref={ref}
         style={style}
@@ -153,6 +165,11 @@ export function SidebarSessionRow({
         {isWorking && !needsInput && <span aria-hidden="true" className="arc-border" />}
         <SidebarRowBody
           className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
+          // The body is a <button>; some Chromium builds refuse to initiate an
+          // ANCESTOR's drag from a form-control child. Making the button
+          // itself draggable guarantees dragstart fires here and bubbles to
+          // the shell's onDragStart above (CRITICAL #16 hardening).
+          draggable
           onClick={event => {
             if (event.shiftKey) {
               event.preventDefault()

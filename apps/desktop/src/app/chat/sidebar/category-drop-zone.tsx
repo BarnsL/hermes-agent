@@ -55,6 +55,14 @@ export function CategoryDropZone({
     }
 
     e.preventDefault()
+
+    if (depth.current === 0) {
+      // Diagnostic breadcrumb mirrored into desktop.log via the main process
+      // (error level required — see session-row.tsx). Once per zone entry,
+      // not per child boundary.
+      console.error('[dnd] session drag over category', categoryId)
+    }
+
     depth.current += 1
     setIsOver(true)
   }
@@ -97,6 +105,8 @@ export function CategoryDropZone({
     reset()
 
     const payload = readSessionDrag(e.dataTransfer)
+
+    console.error('[dnd] drop on category', categoryId, payload?.id ?? `NO PAYLOAD (types: ${[...(e.dataTransfer?.types || [])].join(',')})`)
 
     if (payload?.id) {
       onDropSession(payload.id, categoryId)
