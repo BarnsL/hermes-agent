@@ -2,9 +2,20 @@ import type { MutableRefObject } from 'react'
 import { useCallback, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import {
+  deleteSession,
+  getSessionMessages,
+  SESSION_CREATE_REQUEST_TIMEOUT_MS,
+  SESSION_RESUME_REQUEST_TIMEOUT_MS,
+  setSessionArchived
+} from '@/hermes'
 import { useI18n } from '@/i18n'
-import { preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import {
+  type ChatMessage,
+  preserveLocalAssistantErrors,
+  toChatMessages,
+  toChatMessagesAsync
+} from '@/lib/chat-messages'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -71,7 +82,7 @@ interface SessionActionsOptions {
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
   getRouteToken: () => string
   navigate: NavigateFunction
-  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
@@ -174,14 +185,21 @@ export function useSessionActions({
         const uiEffort = $currentReasoningEffort.get().trim()
         const uiFast = $currentFastMode.get()
 
-        const created = await requestGateway<SessionCreateResponse>('session.create', {
-          cols: 96,
-          ...(cwd && { cwd }),
-          ...(newChatProfile ? { profile: newChatProfile } : {}),
-          ...(uiModel ? { model: uiModel, ...(uiProvider ? { provider: uiProvider } : {}) } : {}),
-          ...(uiEffort ? { reasoning_effort: uiEffort } : {}),
-          ...(uiFast ? { fast: true } : {})
-        })
+        // Generous ack timeout: the backend event loop stalls for tens of
+        // seconds under GIL pressure, and a timed-out create drops the user's
+        // optimistic first message even though the backend would have finished.
+        const created = await requestGateway<SessionCreateResponse>(
+          'session.create',
+          {
+            cols: 96,
+            ...(cwd && { cwd }),
+            ...(newChatProfile ? { profile: newChatProfile } : {}),
+            ...(uiModel ? { model: uiModel, ...(uiProvider ? { provider: uiProvider } : {}) } : {}),
+            ...(uiEffort ? { reasoning_effort: uiEffort } : {}),
+            ...(uiFast ? { fast: true } : {})
+          },
+          SESSION_CREATE_REQUEST_TIMEOUT_MS
+        )
 
         const stored = created.stored_session_id ?? null
 
@@ -448,46 +466,121 @@ export function useSessionActions({
 
       try {
         const watchWindow = isWatchWindow()
-        let localSnapshot = $messages.get()
+        const localSnapshot = $messages.get()
 
         // REST transcript prefetch and the gateway resume RPC are independent
-        // — run them concurrently so a big session's wall time is
-        // max(prefetch, resume) instead of their sum. The prefetch paints the
-        // transcript as soon as it lands; the RPC binds the runtime id.
+        // — run them concurrently and let WHICHEVER LANDS FIRST paint. The
+        // backend event loop can stall for tens of seconds (GIL pressure), so
+        // neither leg may gate the other: the RPC usually returns its (tail)
+        // transcript in a few hundred ms while the full REST transcript takes
+        // longer on a big session, but under a stall either can win.
         // Watch windows skip the prefetch — lazy resume attaches the live mirror.
         const prefetchPromise = watchWindow ? null : getSessionMessages(storedSessionId, sessionProfile)
 
-        const resumePromise = requestGateway<SessionResumeResponse>('session.resume', {
-          session_id: storedSessionId,
-          cols: 96,
-          // Watch windows attach lazily (live mirror). Every other cold resume
-          // gets the gateway's default deferred build: the RPC returns the
-          // transcript immediately instead of blocking the switch on _make_agent
-          // (MCP discovery / prompt build), and the agent pre-warms in the
-          // background while the prefetch above paints the transcript.
-          ...(watchWindow ? { lazy: true } : {}),
-          ...(sessionProfile ? { profile: sessionProfile } : {})
-        })
+        const resumePromise = requestGateway<SessionResumeResponse>(
+          'session.resume',
+          {
+            session_id: storedSessionId,
+            cols: 96,
+            // Watch windows attach lazily (live mirror). Every other cold resume
+            // gets the gateway's default deferred build: the RPC returns the
+            // transcript immediately instead of blocking the switch on _make_agent
+            // (MCP discovery / prompt build), and the agent pre-warms in the
+            // background while the prefetch above paints the transcript.
+            // `transcript_mode: 'tail'` asks a tail-capable backend for just the
+            // last page of messages so the RPC can paint in ~100-300ms; an older
+            // backend ignores the param and returns the full transcript, which
+            // this code treats identically. Either way the REST prefetch
+            // reconciles the view to the full transcript when it lands. Watch
+            // windows keep the full payload — they have no prefetch leg to fill
+            // in the rest.
+            ...(watchWindow ? { lazy: true } : { transcript_mode: 'tail' }),
+            ...(sessionProfile ? { profile: sessionProfile } : {})
+          },
+          // Outlast backend event-loop stalls (63s observed) instead of
+          // converting them into resume failures — see hermes.ts.
+          SESSION_RESUME_REQUEST_TIMEOUT_MS
+        )
 
         // The rejection is consumed by the `await` below; this guard only
         // keeps it from surfacing as unhandled while the prefetch settles.
         resumePromise.catch(() => undefined)
 
-        try {
-          if (prefetchPromise) {
-            const storedMessages = await prefetchPromise
+        // ---- Arrival race: REST prefetch vs. resume RPC ---------------------
+        // `paintedBy` records which source hydrated the view first; the loser
+        // reconciles instead of double-painting. A tail painted by the RPC is
+        // replaced by the full REST transcript (the length mismatch fails the
+        // equivalence check); a full transcript painted by the prefetch makes
+        // the RPC leg skip its own conversion entirely.
+        let paintedBy: 'prefetch' | 'resume' | null = null
+        // The exact array the RPC leg painted, so the prefetch leg can tell
+        // "view untouched since the tail paint" (safe to replace with the full
+        // transcript) from "a live stream flush / optimistic submit has taken
+        // over" (must not clobber those newer messages with an older snapshot).
+        let resumePaintedMessages: ChatMessage[] | null = null
 
-            if (isCurrentResume()) {
-              localSnapshot = preserveLocalAssistantErrors(toChatMessages(storedMessages.messages), $messages.get())
+        const prefetchPaintPromise = prefetchPromise
+          ? prefetchPromise
+              .then(async storedMessages => {
+                if (!isCurrentResume()) {
+                  return
+                }
 
-              if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
-                setMessages(localSnapshot)
-              }
-            }
-          }
-        } catch {
-          // Non-fatal: gateway resume below can still hydrate the session.
-        }
+                // Cooperative conversion — a big stored transcript yields to
+                // the event loop instead of blocking paint in one long task.
+                const converted = await toChatMessagesAsync(storedMessages.messages)
+
+                // Re-check after the conversion's yields: a newer resume or a
+                // session switch may own the view by now.
+                if (!isCurrentResume()) {
+                  return
+                }
+
+                const restMessages = preserveLocalAssistantErrors(converted, $messages.get())
+
+                if (paintedBy === null) {
+                  // First arriver. An empty REST transcript never claims the
+                  // paint, so the resume RPC's transcript still wins (mirrors
+                  // the old `localSnapshot.length > 0` preference order).
+                  if (restMessages.length > 0) {
+                    paintedBy = 'prefetch'
+                  }
+
+                  if (!chatMessageArraysEquivalent($messages.get(), restMessages)) {
+                    setMessages(restMessages)
+                  }
+
+                  return
+                }
+
+                if (paintedBy !== 'resume' || restMessages.length === 0) {
+                  return
+                }
+
+                // Late arrival: the RPC already painted (usually the tail) and
+                // bound the runtime id. Replace tail with full ONLY while the
+                // session cache still holds exactly what the RPC painted — any
+                // newer write (stream delta, optimistic submit) owns the
+                // transcript and must not be clobbered by this older snapshot.
+                const runtimeId = activeSessionIdRef.current
+                const cachedState = runtimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
+
+                if (!runtimeId || !cachedState || cachedState.messages !== resumePaintedMessages) {
+                  return
+                }
+
+                if (chatMessageArraysEquivalent(cachedState.messages, restMessages)) {
+                  return
+                }
+
+                // Route through the session cache (not bare setMessages) so a
+                // later warm-cache switch-back restores the full transcript
+                // instead of the truncated tail; the cache sync publishes to
+                // the view.
+                updateSessionState(runtimeId, state => ({ ...state, messages: restMessages }), storedSessionId)
+              })
+              .catch(() => undefined) // Non-fatal: the RPC (or its REST fallback) hydrates instead.
+          : null
 
         const resumed = await resumePromise
 
@@ -497,30 +590,51 @@ export function useSessionActions({
 
         const currentMessages = $messages.get()
 
-        // Keep the local snapshot when resume would only reshuffle runtime
-        // projection. When the REST prefetch already hydrated the transcript,
-        // skip converting/reconciling the resume payload entirely — on a
-        // 1000+-message session that second conversion plus the deep
-        // equivalence compare costs over a second of main-thread time.
-        const preferredMessages =
-          localSnapshot.length > 0
-            ? localSnapshot
-            : (() => {
-                const resumedMessages = preserveLocalAssistantErrors(
-                  reconcileResumeMessages(toChatMessages(resumed.messages), currentMessages),
-                  currentMessages
-                )
+        let messagesForView: ChatMessage[]
 
-                return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
-              })()
+        if (paintedBy === 'prefetch') {
+          // The prefetch won the race and already painted the full transcript
+          // (error-merged) — reuse the live `$messages` array instead of
+          // converting/reconciling the resume payload; on a 1000+-message
+          // session that second conversion plus the deep equivalence compare
+          // costs over a second of main-thread time.
+          messagesForView = currentMessages
+        } else if (!prefetchPromise && localSnapshot.length > 0) {
+          // No-prefetch path (watch window): keep the locally mirrored
+          // transcript when resume would only reshuffle runtime projection.
+          messagesForView =
+            localSnapshot === currentMessages
+              ? currentMessages
+              : preserveLocalAssistantErrors(localSnapshot, currentMessages)
+        } else {
+          // The RPC is the first arriver (or the prefetch failed / came back
+          // empty): convert and paint its transcript. Under tail mode this is
+          // ~50 messages, so the synchronous conversion stays cheap.
+          const resumedMessages = preserveLocalAssistantErrors(
+            reconcileResumeMessages(toChatMessages(resumed.messages), currentMessages),
+            currentMessages
+          )
 
-        // Prefetch-hit fast path: `preferredMessages` IS the live `$messages`
-        // array (already error-merged when `localSnapshot` was built), so reuse
-        // the ref instead of rebuilding a throwaway transcript+Map every switch.
-        const messagesForView =
-          preferredMessages === currentMessages
+          messagesForView = chatMessageArraysEquivalent(currentMessages, resumedMessages)
             ? currentMessages
-            : preserveLocalAssistantErrors(preferredMessages, currentMessages)
+            : resumedMessages
+        }
+
+        // The RPC transcript came back empty for a session that should have
+        // one. Don't latch failure while the REST leg is still in flight — the
+        // old sequential flow implicitly waited for it, and it regularly has
+        // the messages the RPC payload lacked.
+        if (sessionShouldHaveTranscript(stored) && messagesForView.length === 0 && prefetchPaintPromise) {
+          await prefetchPaintPromise
+
+          if (!isCurrentResume()) {
+            return
+          }
+
+          if (paintedBy === 'prefetch') {
+            messagesForView = $messages.get()
+          }
+        }
 
         if (sessionShouldHaveTranscript(stored) && messagesForView.length === 0) {
           setActiveSessionId(null)
@@ -529,6 +643,13 @@ export function useSessionActions({
           resumedRunning = false
 
           return
+        }
+
+        // Claim the paint only now: an empty transcript above must leave the
+        // race open so a late prefetch can still hydrate the view.
+        if (paintedBy === null) {
+          paintedBy = 'resume'
+          resumePaintedMessages = messagesForView
         }
 
         setActiveSessionId(resumed.session_id)
@@ -572,7 +693,15 @@ export function useSessionActions({
             return
           }
 
-          setMessages(preserveLocalAssistantErrors(toChatMessages(fallback.messages), $messages.get()))
+          // Cooperative conversion — same reason as the prefetch leg: a big
+          // transcript must not block paint/input in one long task.
+          const fallbackMessages = await toChatMessagesAsync(fallback.messages)
+
+          if (!isCurrentResume()) {
+            return
+          }
+
+          setMessages(preserveLocalAssistantErrors(fallbackMessages, $messages.get()))
         } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
           // already shown and fall through to arm the resume-failure latch so

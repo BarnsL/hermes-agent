@@ -71,6 +71,15 @@ import type {
 export const STARTUP_REQUEST_TIMEOUT_MS = 60_000
 const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
+// session.create / session.resume ACK against a backend whose event loop can
+// stall for tens of seconds under GIL pressure (a 63.1s stall was logged in the
+// wild). The generic 30s default converts such a stall into a hard failure:
+// create drops the user's optimistic first message, resume strands the thread
+// loader into the retry latch. Both are user-awaited one-shot RPCs, so give
+// them enough headroom to outlast the worst observed stall instead of failing
+// a backend that is alive-but-busy.
+export const SESSION_CREATE_REQUEST_TIMEOUT_MS = 120_000
+export const SESSION_RESUME_REQUEST_TIMEOUT_MS = 120_000
 // prompt.submit is effectively fire-and-forget: turn completion is signaled by
 // stream / message.complete events, NOT by the RPC return. A long turn (MoA
 // presets running references + aggregator in series, deep reasoning, large tool

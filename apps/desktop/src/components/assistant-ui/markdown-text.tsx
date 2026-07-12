@@ -77,7 +77,12 @@ function preprocessWithTailRepair(text: string): string {
 // with zero correctness risk (same input → same output). Streaming tail
 // growth misses the cache by design (every flush is a new string) — that
 // single lex is the irreducible cost.
-const BLOCK_CACHE_MAX = 64
+//
+// 512 entries (up from 64): switching between a few long sessions evicted
+// everything and re-lexed the whole transcript on every switch-back. Entries
+// only hold references to block strings already retained by `$messages`, so
+// the extra capacity costs pointers, not copies.
+const BLOCK_CACHE_MAX = 512
 const BLOCK_CACHE_MIN_LENGTH = 1024
 const blockCache = new Map<string, string[]>()
 

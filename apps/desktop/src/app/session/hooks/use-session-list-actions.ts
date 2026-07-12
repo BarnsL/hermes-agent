@@ -1,4 +1,4 @@
-import { useCallback, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 
 import { getCronJobs, listAllProfileSessions, type SessionInfo } from '@/hermes'
 import {
@@ -40,6 +40,13 @@ const SIDEBAR_EXCLUDED_SOURCES = ['cron', 'subagent', 'tool', ...MESSAGING_SESSI
 // The messaging slice is the inverse: drop cron + every local source so only
 // external-platform conversations remain, then split per platform in the UI.
 const MESSAGING_EXCLUDED_SOURCES = ['cron', ...LOCAL_SESSION_SOURCE_IDS]
+
+// Completed turns land in bursts (parallel sessions, queued drains), and each
+// refreshSessions used to fan the cron-sessions + cron-jobs + messaging trio
+// straight onto a backend event loop that can already be stalled — 5-6 fetches
+// per settling turn. A trailing-edge debounce collapses a burst into one trio
+// fetch; the 30s cron / 10s messaging interval polls own steady-state freshness.
+const AUXILIARY_SECTIONS_REFRESH_DEBOUNCE_MS = 2_500
 
 // Rows a session refresh must preserve even if the aggregator omits them:
 // in-flight first turns (message_count 0), pinned rows aged off the page, the
@@ -152,6 +159,34 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     }
   }, [])
 
+  const auxiliaryRefreshTimerRef = useRef<null | number>(null)
+
+  // Trailing-edge debounce for the auxiliary sidebar sections (cron sessions,
+  // cron jobs, messaging). Every scheduling call resets the timer, so a burst
+  // of refreshSessions invocations (turns settling back-to-back) resolves to a
+  // single trio fetch after the burst quiets down.
+  const scheduleAuxiliarySectionsRefresh = useCallback(() => {
+    if (auxiliaryRefreshTimerRef.current !== null) {
+      window.clearTimeout(auxiliaryRefreshTimerRef.current)
+    }
+
+    auxiliaryRefreshTimerRef.current = window.setTimeout(() => {
+      auxiliaryRefreshTimerRef.current = null
+      void refreshCronSessions()
+      void refreshCronJobs()
+      void refreshMessagingSessions()
+    }, AUXILIARY_SECTIONS_REFRESH_DEBOUNCE_MS)
+  }, [refreshCronJobs, refreshCronSessions, refreshMessagingSessions])
+
+  useEffect(
+    () => () => {
+      if (auxiliaryRefreshTimerRef.current !== null) {
+        window.clearTimeout(auxiliaryRefreshTimerRef.current)
+      }
+    },
+    []
+  )
+
   const refreshSessions = useCallback(async () => {
     const requestId = refreshSessionsRequestRef.current + 1
     refreshSessionsRequestRef.current = requestId
@@ -188,10 +223,8 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       }
     }
 
-    void refreshCronSessions()
-    void refreshCronJobs()
-    void refreshMessagingSessions()
-  }, [profileScope, refreshCronSessions, refreshCronJobs, refreshMessagingSessions])
+    scheduleAuxiliarySectionsRefresh()
+  }, [profileScope, scheduleAuxiliarySectionsRefresh])
 
   const loadMoreSessions = useCallback(async () => {
     bumpSessionsLimit()

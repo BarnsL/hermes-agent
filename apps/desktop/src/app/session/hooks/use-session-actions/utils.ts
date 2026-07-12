@@ -1,5 +1,5 @@
 import { getSession } from '@/hermes'
-import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
+import { type ChatMessage, type ChatMessagePart, chatMessageText } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { requestDesktopOnboarding } from '@/store/onboarding'
@@ -50,6 +50,43 @@ function preserveReasoningParts(message: ChatMessage, previous: ChatMessage): Ch
   return reasoningParts.length ? { ...message, parts: [...reasoningParts, ...message.parts] } : message
 }
 
+// Typed cheap comparator instead of per-part JSON.stringify: stringifying
+// tool-call results (often 100KB+ of command output) per part per compare
+// dominated resume-time equivalence checks on tool-heavy transcripts.
+// Reference equality catches the common untouched-part case; otherwise compare
+// only the cheap identifying fields per part kind. Tool results compare by
+// reference — a deep-equal-but-recreated result reads as "different" and
+// triggers a repaint, which is the safe direction (never a stale skip).
+function chatMessagePartsEquivalent(a: ChatMessagePart, b: ChatMessagePart): boolean {
+  if (a === b) {
+    return true
+  }
+
+  if (a.type !== b.type) {
+    return false
+  }
+
+  if (a.type === 'text' || a.type === 'reasoning') {
+    return a.text === (b as Extract<ChatMessagePart, { type: 'reasoning' | 'text' }>).text
+  }
+
+  if (a.type === 'tool-call') {
+    const other = b as Extract<ChatMessagePart, { type: 'tool-call' }>
+
+    return (
+      a.toolCallId === other.toolCallId &&
+      a.toolName === other.toolName &&
+      a.argsText === other.argsText &&
+      a.result === other.result &&
+      a.isError === other.isError
+    )
+  }
+
+  // Rare part kinds (image/file/source/...) keep the old deep compare — they
+  // never appear in stored-transcript conversions, so this path stays cold.
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
 function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean {
   if (
     a.id !== b.id ||
@@ -66,7 +103,7 @@ function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean {
     return false
   }
 
-  return a.parts.every((part, index) => JSON.stringify(part) === JSON.stringify(b.parts[index]))
+  return a.parts.every((part, index) => chatMessagePartsEquivalent(part, b.parts[index]))
 }
 
 export function chatMessageArraysEquivalent(a: ChatMessage[], b: ChatMessage[]): boolean {
