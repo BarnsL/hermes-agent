@@ -120,8 +120,17 @@ function scheduleReconnect(entry: Secondary): void {
     return
   }
 
-  // 1s, 2s, 4s … capped at 15s — same backoff shape as the primary.
-  const delay = Math.min(15_000, 1_000 * 2 ** Math.min(entry.reconnectAttempt, 4))
+  // Schedule: 0, 1s, 2s, 4s, 8s … capped at 15s — same backoff shape as the
+  // primary. The first attempt after a drop fires immediately (delay 0) to shave
+  // the ~1s dead time off recovery; the immediate attempt consumes attempt 0, so
+  // the exponent is offset by one to keep subsequent delays at 1s, 2s, 4s, 8s,
+  // 15s. Secondaries skip the primary's flap guard (background sockets don't gate
+  // the composer, so a rare flap is harmless).
+  const delay =
+    entry.reconnectAttempt === 0
+      ? 0
+      : Math.min(15_000, 1_000 * 2 ** Math.min(Math.max(0, entry.reconnectAttempt - 1), 4))
+
   entry.reconnectAttempt += 1
   entry.reconnectTimer = setTimeout(() => {
     entry.reconnectTimer = null

@@ -4038,7 +4038,11 @@ function createTray() {
           isQuitting = true
           if (tray) { tray.destroy(); tray = null }
           app.relaunch()
-          app.exit()
+          // Use app.quit() (not app.exit()) so the before-quit teardown runs and
+          // stops hermesProcess + pool backends. app.exit() skips before-quit,
+          // orphaning the spawned `hermes serve` backends into a pileup that
+          // compounds memory/DB pressure. (Same proven path as "Quit Hermes".)
+          app.quit()
         }
       },
       { type: 'separator' },
@@ -5259,6 +5263,12 @@ function resetBootProgressForReconnect() {
 
 function stopBackendChild(child) {
   if (!child || child.killed) return
+  // Mark this as a deliberate, desktop-initiated stop so the child's 'exit'
+  // handler can distinguish it from a real crash. Every teardown path (tray
+  // Restart/Quit, before-quit, resetHermesConnection, stopPoolBackend, the
+  // teardown*AndWait helpers) funnels its kill through here, so this single
+  // choke point attributes them all before the taskkill fires.
+  child.weKilledIt = true
   try {
     if (IS_WINDOWS && Number.isInteger(child.pid)) {
       forceKillProcessTree(child.pid)
@@ -5480,7 +5490,11 @@ async function spawnPoolBackend(profile, entry) {
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
-    rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
+    // Attribute the exit: a deliberate desktop stop (weKilledIt) vs a possible
+    // fault. Never suppress the UNEXPECTED case — any exit we didn't cause must
+    // stay visible as a candidate crash.
+    const attribution = child.weKilledIt ? '[deliberate stop]' : '[UNEXPECTED]'
+    rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code}) ${attribution}`)
     backendPool.delete(profile)
     if (!ready) {
       rejectStart?.(
@@ -5714,6 +5728,10 @@ async function startHermes() {
       })
     )
 
+    // Stable reference for the exit handler: teardown paths null out
+    // hermesProcess (and may reassign it to a fresh spawn) before this child's
+    // 'exit' fires, so read the kill-attribution flag off the captured child.
+    const primaryChild = hermesProcess
     hermesProcess.stdout.on('data', rememberLog)
     hermesProcess.stderr.on('data', rememberLog)
     let backendReady = false
@@ -5738,7 +5756,11 @@ async function startHermes() {
       rejectBackendStart?.(error)
     })
     hermesProcess.once('exit', (code, signal) => {
-      rememberLog(`Hermes backend exited (${signal || code})`)
+      // Attribute the exit: a deliberate desktop stop (weKilledIt, set by
+      // stopBackendChild) vs a possible fault. Never suppress the UNEXPECTED
+      // case — an exit we didn't cause must stay visible as a candidate crash.
+      const attribution = primaryChild.weKilledIt ? '[deliberate stop]' : '[UNEXPECTED]'
+      rememberLog(`Hermes backend exited (${signal || code}) ${attribution}`)
       hermesProcess = null
       connectionPromise = null
       sendBackendExit({ code, signal })

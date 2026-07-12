@@ -952,11 +952,49 @@ def run_conversation(
         # separate field. Add tools back for compression decisions so long
         # tool-heavy turns do not creep up to the context ceiling and leave
         # no room for the model's final answer.
+        #
+        # WHY (event-loop / GIL): this block runs on every API call (roughly
+        # 20x on a tool-heavy turn) over a 50k+ token history. The previous
+        # code performed THREE full str(history) passes per call: (1) the char
+        # sum below, (2) estimate_messages_tokens_rough, and (3)
+        # estimate_request_tokens_rough, which internally re-ran
+        # estimate_messages_tokens_rough (a third full history pass) AND
+        # re-stringified the ~50-tool schema every call. Each str() pass holds
+        # the GIL for the whole history, stalling the asyncio event loop
+        # (Discord heartbeat, token streaming). We keep one genuine char pass
+        # plus one token pass, then derive request_pressure_tokens
+        # arithmetically from approx_tokens plus a CACHED tool-schema token
+        # count. The result is bit-identical to
+        # estimate_request_tokens_rough(api_messages, tools=agent.tools or None)
+        # (no system_prompt was ever passed there), with identical logged
+        # semantics, but without the third history pass or the per-call tool
+        # re-stringify.
+        #
+        # total_chars is a real char count (it also includes base64 image
+        # bytes, which the token estimator strips), so it is NOT derived from
+        # tokens; treat it as an approximate size-in-chars figure for logging.
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
-        request_pressure_tokens = estimate_request_tokens_rough(
-            api_messages, tools=agent.tools or None
-        )
+
+        # Cached tool-schema token count. Keyed on the agent's tool-snapshot
+        # generation (bumped by refresh_agent_mcp_tools whenever agent.tools is
+        # replaced), NOT on the turn: a concurrent MCP refresh can swap
+        # agent.tools mid-session, and the generation is the only signal that
+        # the ~50-tool schema string actually changed. Reading the generation
+        # BEFORE agent.tools matches refresh_agent_mcp_tools' write order
+        # (tools assigned, then generation bumped), so a newer generation
+        # always implies newer tools; any stale pairing self-heals on the next
+        # call and only perturbs a rough read-only estimate.
+        _tool_gen = getattr(agent, "_tool_snapshot_generation", 0)
+        _tools = agent.tools
+        if _tools:
+            if getattr(agent, "_cached_tool_token_gen", None) != _tool_gen:
+                agent._cached_tool_token_count = (len(str(_tools)) + 3) // 4
+                agent._cached_tool_token_gen = _tool_gen
+            cached_tool_tokens = agent._cached_tool_token_count
+        else:
+            cached_tool_tokens = 0
+        request_pressure_tokens = approx_tokens + cached_tool_tokens
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, request_pressure_tokens
