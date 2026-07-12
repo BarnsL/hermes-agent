@@ -2578,6 +2578,30 @@ async def get_system_stats():
     return info
 
 
+@app.get("/api/diagnostics/perf")
+async def get_diagnostics_perf():
+    """Gateway performance snapshot: per-RPC timings (run + pool-queue),
+    slowest calls, event-loop lag from the heartbeat watchdog, and named
+    session.create/session.resume/agent.build stage timings.
+
+    Added to make the production 'event loop stalled Ns (GIL pressure
+    suspected)' bursts diagnosable through the API. Same auth as
+    /api/sessions (session-token gate via auth_middleware — deliberately NOT
+    in PUBLIC_API_PATHS). Read-only and in-memory, so it stays cheap to poll.
+    """
+    try:
+        from tui_gateway.diagnostics import snapshot
+    except Exception:
+        # web_server can run without tui_gateway; report the capability gap
+        # rather than a 500.
+        raise HTTPException(status_code=503, detail="diagnostics unavailable")
+    try:
+        return snapshot()
+    except Exception:
+        _log.exception("GET /api/diagnostics/perf failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 # ---------------------------------------------------------------------------
 # Curator endpoints — background skill-maintenance status + controls.
 #
@@ -15415,6 +15439,15 @@ def start_server(
             except Exception as exc:  # pragma: no cover - best-effort
                 _log.debug("loop noise filter install skipped: %s", exc)
 
+            # Shorten the GIL slice (default 5ms → 1ms) so concurrent
+            # pure-Python turn threads convoy less on the event-loop thread:
+            # the heartbeat below logged 8-63s stalls ("GIL pressure
+            # suspected") while agent turns held the interpreter. This only
+            # helps bytecode-level contention — a long C-level call that never
+            # releases the GIL is unaffected — but it meaningfully reduces how
+            # long the loop waits for its next slice under thread pressure.
+            sys.setswitchinterval(0.001)
+
             # ── Loop heartbeat watchdog (CF-1) ───────────────────────────
             # Confirm the GIL-pressure hypothesis in production. Re-arm a 2s
             # tick and measure the drift between when it *should* fire and
@@ -15428,9 +15461,23 @@ def start_server(
             _hb_stall_threshold = 5.0
             _hb_loop = asyncio.get_running_loop()
 
+            # Feed every tick's drift into the gateway diagnostics collector
+            # so the stalls are queryable via diagnostics.perf /
+            # /api/diagnostics/perf instead of log archaeology. Import-guarded:
+            # web_server must keep working without tui_gateway installed.
+            try:
+                from tui_gateway.diagnostics import record_loop_lag as _record_loop_lag
+            except Exception:
+                _record_loop_lag = None
+
             def _loop_heartbeat(expected: float) -> None:
                 now = _hb_loop.time()
                 drift = now - expected
+                if _record_loop_lag is not None:
+                    try:
+                        _record_loop_lag(drift * 1000.0)
+                    except Exception:
+                        pass
                 if drift > _hb_stall_threshold:
                     _log.warning(
                         "event loop stalled %.1fs (GIL pressure suspected)",

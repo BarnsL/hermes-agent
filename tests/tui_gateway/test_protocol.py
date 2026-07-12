@@ -370,6 +370,11 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
                 {"role": "assistant", "content": "yo"},
             ]
 
+        def count_ancestor_messages(self, _sid):
+            # No lineage ancestors: the single ancestor-inclusive read is
+            # sliced at prefix 0 (raw history == display history).
+            return 0
+
     builds: list = []
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -997,6 +1002,11 @@ def test_session_resume_live_payload_uses_current_history_with_ancestors(server,
             if include_ancestors:
                 return ancestor_history + current_history
             return list(current_history)
+
+        def count_ancestor_messages(self, _sid):
+            # The display/raw split is now derived from this count against the
+            # single ancestor-inclusive read (one lineage ancestor row here).
+            return len(ancestor_history)
 
     class _Worker:
         def close(self):

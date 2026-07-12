@@ -114,9 +114,12 @@ class ToolEntry:
 # probe external state (Docker daemon, Modal SDK install, playwright binary
 # availability). For a long-lived CLI or gateway process, calling them on
 # every get_definitions() is pure waste — external state changes on human
-# timescales. Cache results for ~30 s so env-var flips via ``hermes tools``
-# or live credential file changes propagate within a turn or two without
-# requiring any explicit invalidation.
+# timescales. Cache results for ~5 min: the old 30s TTL meant every agent
+# build / get_tool_definitions() burst re-spawned the docker/modal/playwright
+# probe subprocesses, which piled onto the gateway's observed GIL-pressure
+# event-loop stalls. Config edits still propagate immediately —
+# model_tools.get_tool_definitions fingerprints config.yaml per call and
+# invokes invalidate_check_fn_cache() when it changes.
 #
 # Transient-failure suppression (issue #21658 / #5304): these probes can flap.
 # A single ``subprocess.run([docker, "version"], timeout=5)`` that times out
@@ -131,7 +134,7 @@ class ToolEntry:
 # went down stops advertising its tools.
 # ---------------------------------------------------------------------------
 
-_CHECK_FN_TTL_SECONDS = 30.0
+_CHECK_FN_TTL_SECONDS = 300.0
 # How long after a successful check a subsequent transient failure is treated
 # as a flake (last-good True is served) rather than a real outage. Kept short
 # so a genuinely-down backend is reflected within a couple of turns.

@@ -42,6 +42,14 @@ _WARM_WORKERS = 8
 # a single project-tree build (and rapid re-opens) would otherwise fire.
 _NEG_TTL = 30.0
 
+# How long a current-branch answer stays cached. Unlike repo roots (stable for
+# the process lifetime), the checked-out branch changes with ordinary git use,
+# so EVERY branch result — positive or negative — expires after this TTL. 10s
+# collapses the bursts of per-session probes (session.create/resume info,
+# sidebar refresh) into one git spawn, while a `git switch` still shows up in
+# the UI within seconds.
+_BRANCH_TTL = 10.0
+
 
 def run_git(cwd: str, *args: str) -> str:
     """``git -C <cwd> <args>`` → stripped stdout, or ``""`` on any failure."""
@@ -66,7 +74,21 @@ def run_git(cwd: str, *args: str) -> str:
 
 
 def branch(cwd: str) -> str:
-    return run_git(cwd, "branch", "--show-current") or run_git(cwd, "rev-parse", "--short", "HEAD")
+    """Current branch (or short detached HEAD) for ``cwd``, cached ~10s.
+
+    Uncached, each call spawned up to TWO git subprocesses with 1.5s timeouts,
+    and callers ran it inline on RPC response paths (session.create/resume
+    info) — piling subprocess spawns onto the event-loop stalls logged in
+    gui.log as 'event loop stalled Ns (GIL pressure suspected)'. The short TTL
+    (see ``_BRANCH_TTL``) keeps branch switches visible within seconds.
+    """
+    if not cwd:
+        return ""
+    return _branch_cache.resolve(
+        cwd,
+        lambda: run_git(cwd, "branch", "--show-current")
+        or run_git(cwd, "rev-parse", "--short", "HEAD"),
+    )
 
 
 class _RootCache:
@@ -129,12 +151,66 @@ class _RootCache:
             return value
 
 
+class _BranchCache:
+    """Thread-safe, single-flight cache where EVERY entry expires after a
+    short TTL. Mirrors ``_RootCache``'s leader/follower protocol; it differs
+    only in that positive results also expire — branch names are mutable
+    where repo roots are not."""
+
+    def __init__(self, ttl: float) -> None:
+        self._ttl = ttl
+        self._lock = threading.Lock()
+        self._values: dict[str, tuple[float, str]] = {}  # key -> (expiry, value)
+        self._inflight: dict[str, threading.Event] = {}
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._values.clear()
+            self._inflight.clear()
+
+    def resolve(self, key: str, probe) -> str:
+        while True:
+            with self._lock:
+                hit = self._values.get(key)
+                if hit is not None:
+                    expiry, value = hit
+                    if expiry > time.monotonic():
+                        return value
+                    del self._values[key]
+                gate = self._inflight.get(key)
+                if gate is None:
+                    gate = threading.Event()
+                    self._inflight[key] = gate
+                    leader = True
+                else:
+                    leader = False
+
+            if not leader:
+                # Another thread is probing this key — wait, then re-read.
+                # branch() may run two sequential git commands, so allow for
+                # both timeouts before giving up on the leader.
+                gate.wait(timeout=_GIT_TIMEOUT * 2 + 0.5)
+                continue
+
+            value = ""
+            try:
+                value = probe()
+            finally:
+                with self._lock:
+                    self._values[key] = (time.monotonic() + self._ttl, value)
+                    self._inflight.pop(key, None)
+                gate.set()
+            return value
+
+
 _cache = _RootCache()
+_branch_cache = _BranchCache(_BRANCH_TTL)
 
 
 def invalidate() -> None:
     """Drop cached roots after a known mutation (e.g. a worktree was added)."""
     _cache.invalidate()
+    _branch_cache.invalidate()
 
 
 def repo_root(cwd: str) -> str:

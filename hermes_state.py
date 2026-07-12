@@ -909,6 +909,11 @@ class SessionDB:
         self._trigram_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        # Optional dedicated read-only connection (own lock) for the pure-read
+        # methods — see _read_ctx. None until (and unless) the main connection
+        # is up in WAL mode.
+        self._read_conn = None
+        self._read_lock = threading.Lock()
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -974,6 +979,8 @@ class SessionDB:
                 if not report.get("repaired"):
                     raise
                 _connect_and_init()
+
+            self._open_read_connection()
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -989,6 +996,54 @@ class SessionDB:
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+
+    # ── Read-path connection ──
+
+    def _open_read_connection(self) -> None:
+        """Best-effort second, READ-ONLY connection for the pure-read methods.
+
+        Every SessionDB access used to serialize behind the single Python-level
+        ``self._lock``, so resume-path transcript reads queued behind
+        FTS-amplified message writes from live agent turns (observed as
+        multi-second session.resume and the gateway's 'event loop stalled Ns
+        (GIL pressure suspected)' bursts). WAL mode guarantees readers a
+        consistent committed snapshot without blocking (or being blocked by)
+        the writer, so routing reads through their own connection + lock
+        removes that convoy entirely.
+
+        Only opened when the main connection actually runs in WAL mode — in
+        the DELETE-journal fallback (e.g. NFS homes) a second reader could hit
+        SQLITE_BUSY against the writer, which the old serialized design never
+        surfaced. Never raises; on any failure ``_read_ctx`` falls back to the
+        main connection, i.e. exactly the old behaviour.
+        """
+        try:
+            with self._lock:
+                row = self._conn.execute("PRAGMA journal_mode").fetchone()
+            mode = str(row[0] if row else "").lower()
+            if mode != "wal":
+                return
+            conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro",
+                uri=True,
+                check_same_thread=False,
+                timeout=1.0,
+                isolation_level=None,
+            )
+            conn.row_factory = sqlite3.Row
+            self._read_conn = conn
+        except Exception:
+            self._read_conn = None
+
+    def _read_ctx(self) -> tuple:
+        """(lock, connection) pair for pure-read queries: the dedicated
+        read-only connection when it opened, else the main connection. WAL
+        readers see every committed write, so read-your-writes still holds
+        for callers that read after a write method returns."""
+        conn = self._read_conn
+        if conn is not None:
+            return self._read_lock, conn
+        return self._lock, self._conn
 
     # ── Core write helper ──
 
@@ -1244,6 +1299,13 @@ class SessionDB:
         Attempts a TRUNCATE WAL checkpoint first so that exiting processes
         help shrink the WAL file.
         """
+        with self._read_lock:
+            if self._read_conn is not None:
+                try:
+                    self._read_conn.close()
+                except Exception:
+                    pass
+                self._read_conn = None
         with self._lock:
             if self._conn:
                 try:
@@ -2578,8 +2640,11 @@ class SessionDB:
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
-        with self._lock:
-            cursor = self._conn.execute(
+        # Pure read — routed through the dedicated read-only connection (see
+        # _open_read_connection) so it never queues behind message writes.
+        lock, conn = self._read_ctx()
+        with lock:
+            cursor = conn.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
             )
             row = cursor.fetchone()
@@ -2747,8 +2812,9 @@ class SessionDB:
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
-        with self._lock:
-            cursor = self._conn.execute(
+        lock, conn = self._read_ctx()
+        with lock:
+            cursor = conn.execute(
                 "SELECT title FROM sessions WHERE id = ?", (session_id,)
             )
             row = cursor.fetchone()
@@ -2900,11 +2966,12 @@ class SessionDB:
         """
         current = session_id
         seen = {current} if current else set()
+        lock, conn = self._read_ctx()
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
-            with self._lock:
-                cursor = self._conn.execute(
+            with lock:
+                cursor = conn.execute(
                     """
                     SELECT child.id
                     FROM sessions parent
@@ -3196,8 +3263,11 @@ class SessionDB:
                 LIMIT ? OFFSET ?
             """
             params.extend([limit, offset])
-        with self._lock:
-            cursor = self._conn.execute(query, params)
+        # Sidebar/list hot path: routed through the read-only connection so
+        # the recursive-CTE scan can't queue behind live-turn writes.
+        lock, conn = self._read_ctx()
+        with lock:
+            cursor = conn.execute(query, params)
             rows = cursor.fetchall()
         sessions = []
         for row in rows:
@@ -3336,8 +3406,9 @@ class SessionDB:
             FROM sessions s
             WHERE s.id = ?
         """
-        with self._lock:
-            cursor = self._conn.execute(query, (session_id,))
+        lock, conn = self._read_ctx()
+        with lock:
+            cursor = conn.execute(query, (session_id,))
             row = cursor.fetchone()
         if not row:
             return None
@@ -3714,8 +3785,9 @@ class SessionDB:
         timestamp — see c03acca50 for the WSL2 clock-regression rationale.
         """
         active_clause = "" if include_inactive else " AND active = 1"
-        with self._lock:
-            cursor = self._conn.execute(
+        lock, conn = self._read_ctx()
+        with lock:
+            cursor = conn.execute(
                 "SELECT * FROM messages WHERE session_id = ?"
                 f"{active_clause} ORDER BY id",
                 (session_id,),
@@ -3762,9 +3834,10 @@ class SessionDB:
         """
         if window < 0:
             window = 0
-        with self._lock:
+        lock, conn = self._read_ctx()
+        with lock:
             # Confirm the anchor exists in this session.
-            anchor_exists = self._conn.execute(
+            anchor_exists = conn.execute(
                 "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
                 (around_message_id, session_id),
             ).fetchone()
@@ -3773,13 +3846,13 @@ class SessionDB:
 
             # Two queries: anchor + before (DESC, take window+1), and after
             # (ASC, take window). Final order is id ASC.
-            before_rows = self._conn.execute(
+            before_rows = conn.execute(
                 "SELECT * FROM messages "
                 "WHERE session_id = ? AND id <= ? "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, around_message_id, window + 1),
             ).fetchall()
-            after_rows = self._conn.execute(
+            after_rows = conn.execute(
                 "SELECT * FROM messages "
                 "WHERE session_id = ? AND id > ? "
                 "ORDER BY id ASC LIMIT ?",
@@ -4041,9 +4114,12 @@ class SessionDB:
             session_ids = self._session_lineage_root_to_tip(session_id)
 
         active_clause = "" if include_inactive else " AND active = 1"
-        with self._lock:
+        # The resume hot path: routed through the read-only connection so a
+        # long transcript read can't queue behind (or stall) live-turn writes.
+        lock, conn = self._read_ctx()
+        with lock:
             placeholders = ",".join("?" for _ in session_ids)
-            rows = self._conn.execute(
+            rows = conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
@@ -4138,13 +4214,14 @@ class SessionDB:
         chain = []
         current = session_id
         seen = set()
-        with self._lock:
+        lock, conn = self._read_ctx()
+        with lock:
             for _ in range(100):
                 if not current or current in seen:
                     break
                 seen.add(current)
                 chain.append(current)
-                row = self._conn.execute(
+                row = conn.execute(
                     "SELECT parent_session_id FROM sessions WHERE id = ?",
                     (current,),
                 ).fetchone()
@@ -4152,6 +4229,34 @@ class SessionDB:
                     break
                 current = row["parent_session_id"] if hasattr(row, "keys") else row[0]
         return list(reversed(chain)) or [session_id]
+
+    def count_ancestor_messages(
+        self, session_id: str, include_inactive: bool = False
+    ) -> int:
+        """Number of message rows belonging to *session_id*'s lineage ANCESTORS
+        — everything :meth:`get_messages_as_conversation`
+        (``include_ancestors=True``) prepends before the session's own rows.
+
+        Lets the gateway's resume path derive the display/model transcript
+        split from ONE ancestor-inclusive read plus this cheap COUNT, instead
+        of loading and decoding the whole transcript twice (the second full
+        read doubled resume DB time on long sessions). Returns 0 when the
+        session has no ancestors.
+        """
+        lineage = self._session_lineage_root_to_tip(session_id)
+        ancestors = [sid for sid in lineage if sid and sid != session_id]
+        if not ancestors:
+            return 0
+        active_clause = "" if include_inactive else " AND active = 1"
+        lock, conn = self._read_ctx()
+        with lock:
+            placeholders = ",".join("?" for _ in ancestors)
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM messages WHERE session_id IN ({placeholders})"
+                f"{active_clause}",
+                tuple(ancestors),
+            ).fetchone()
+        return int(row[0]) if row else 0
 
     @staticmethod
     def _is_duplicate_replayed_user_message(messages: List[Dict[str, Any]], msg: Dict[str, Any]) -> bool:

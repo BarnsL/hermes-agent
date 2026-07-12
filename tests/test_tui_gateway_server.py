@@ -981,6 +981,10 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
                 else [{"role": "user", "content": "tip prompt"}]
             )
 
+        def count_ancestor_messages(self, target):
+            captured.setdefault("ancestor_counts", []).append(target)
+            return 1
+
     monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
@@ -1015,7 +1019,11 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         {"role": "user", "text": "root prompt"},
         {"role": "assistant", "text": "root answer"},
     ]
-    assert captured["history_calls"] == [("tip", False), ("tip", True)]
+    # ONE ancestor-inclusive transcript read; the raw (model-fed) history is
+    # sliced from it via the cheap ancestor COUNT instead of a second full
+    # read of the same rows.
+    assert captured["history_calls"] == [("tip", True)]
+    assert captured["ancestor_counts"] == ["tip"]
 
 
 def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
@@ -5443,12 +5451,17 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
 def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     """Regression guard: if session.close runs while session.create's
     _build thread is still constructing the agent, the build thread
-    must detect the orphan and clean up the slash_worker + notify
-    registration it's about to install.  Without the cleanup those
-    resources leak — the subprocess stays alive until atexit and the
-    notify callback lingers in the global registry."""
+    must detect the orphan and clean up the notify registration it's
+    about to install.
+
+    The deferred build no longer spawns a _SlashWorker at all (each worker
+    is a full Python subprocess; slash.exec lazily creates one on first
+    slash use), so this race can no longer orphan a worker subprocess —
+    this test now asserts BOTH that no worker was created during the build
+    AND that the notify registration is still cleaned up."""
     import threading
 
+    spawned_workers: list[str] = []
     closed_workers: list[str] = []
     unregistered_keys: list[str] = []
 
@@ -5456,6 +5469,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
         def __init__(self, key, model):
             self.key = key
             self._closed = False
+            spawned_workers.append(key)
 
         def close(self):
             self._closed = True
@@ -5539,23 +5553,26 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     )
     assert close_resp.get("result", {}).get("closed") is True
 
-    # At this point session.close saw slash_worker=None (not yet
-    # installed) so it didn't close anything.  Release the build thread
-    # and let it finish — it should detect the orphan and clean up the
-    # worker it just allocated + unregister the notify.
+    # At this point session.close saw slash_worker=None (never spawned
+    # during a deferred build).  Release the build thread and let it
+    # finish — it should detect the orphan and unregister the notify.
     release_build.set()
 
     # Give the build thread a moment to run through its finally.
     for _ in range(100):
-        if closed_workers:
+        if unregistered_keys:
             break
         import time
 
         time.sleep(0.02)
 
-    assert (
-        len(closed_workers) == 1
-    ), f"orphan worker was not cleaned up — closed_workers={closed_workers}"
+    # No worker may be spawned (or therefore closed) during the deferred
+    # build: the eager per-session subprocess spawn was removed, so this
+    # race has nothing left to orphan.
+    assert spawned_workers == [], (
+        f"deferred build spawned a slash worker — spawned={spawned_workers}"
+    )
+    assert closed_workers == []
     # Notify may be unregistered by both session.close (unconditional)
     # and the orphan-cleanup path; the key guarantee is that the build
     # thread does at least one unregister call (any prior close
@@ -5568,8 +5585,10 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
 
 def test_session_create_no_race_keeps_worker_alive(monkeypatch):
     """Regression guard: when session.close does NOT race, the build
-    thread must install the worker + notify normally and leave them
-    alone (no over-eager cleanup)."""
+    thread must install the notify normally and leave it alone (no
+    over-eager cleanup). The slash worker is no longer eagerly spawned
+    during the build (slash.exec creates it lazily on first use), so the
+    session's slash_worker must remain None after a clean build."""
     closed_workers: list[str] = []
     unregistered_keys: list[str] = []
 
@@ -5652,8 +5671,10 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
             own_unregistered == []
         ), f"build thread unregistered its own notify despite no race: {own_unregistered}"
 
-        # Session should have the live worker installed.
-        assert session.get("slash_worker") is not None
+        # No eager worker anymore: each _SlashWorker is a full Python
+        # subprocess, so the deferred build leaves slash_worker=None and
+        # slash.exec spawns one lazily on first slash use.
+        assert session.get("slash_worker") is None
     finally:
         # Cleanup + restore sibling sessions we snapshotted.
         server._sessions.clear()

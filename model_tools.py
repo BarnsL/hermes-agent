@@ -276,6 +276,30 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+# The registry's check_fn TTL is 300s (raised from 30s: those probes spawn
+# docker/modal/playwright subprocesses on every agent build, which piled onto
+# the gateway's observed GIL-pressure event-loop stalls). Config edits must
+# still take effect immediately, and we already stat config.yaml on every
+# quiet-mode get_tool_definitions() call — so when that fingerprint changes,
+# drop the registry's check_fn cache at zero extra I/O.
+_CFG_FP_UNSET = object()
+_cfg_fp_seen: Any = _CFG_FP_UNSET
+
+
+def _note_config_fingerprint(cfg_fp: Any) -> None:
+    global _cfg_fp_seen
+    if _cfg_fp_seen is not _CFG_FP_UNSET and cfg_fp != _cfg_fp_seen:
+        try:
+            from tools.registry import invalidate_check_fn_cache
+
+            invalidate_check_fn_cache()
+        except Exception:
+            pass
+    # Benign race: two threads may both see the change and double-invalidate;
+    # invalidation is idempotent, so no lock is needed here.
+    _cfg_fp_seen = cfg_fp
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -316,6 +340,7 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        _note_config_fingerprint(cfg_fp)
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,

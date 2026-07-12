@@ -417,7 +417,47 @@ def _env_ref_name(ref: str) -> str:
 # Security helpers
 # ---------------------------------------------------------------------------
 
-def _build_safe_env(user_env: Optional[dict]) -> dict:
+# (server_name, key) pairs already warned about by _coerce_config_json, so a
+# malformed value warns ONCE per process instead of on every reconnect probe.
+_coerce_warned: set = set()
+_coerce_warned_lock = threading.Lock()
+
+
+def _coerce_config_json(server_name: str, key: str, value, expected_type, default):
+    """Tolerate a quoted YAML scalar where config expects a mapping/list.
+
+    A user quoting the ``env``/``args`` block in config.yaml delivers a
+    *string* like ``'{"K": "V"}'``; passing that to ``env.update()`` /
+    ``StdioServerParameters`` crashed every connect attempt with
+    "dictionary update sequence element #0 has length 1" and the parked
+    server re-probed (and re-crashed) every 5 minutes. Parse the string as
+    JSON when it yields *expected_type*; otherwise warn once and fall back
+    to *default* so the server can still start.
+    """
+    if value is None or isinstance(value, expected_type):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, expected_type):
+            return parsed
+    warn_key = (server_name, key)
+    with _coerce_warned_lock:
+        first = warn_key not in _coerce_warned
+        _coerce_warned.add(warn_key)
+    if first:
+        logger.warning(
+            "MCP server '%s': config '%s' should be a %s, got %s — ignoring "
+            "the value. Fix the entry in config.yaml (unquote the block or "
+            "make it valid JSON).",
+            server_name, key, expected_type.__name__, type(value).__name__,
+        )
+    return default
+
+
+def _build_safe_env(user_env: Optional[dict], server_name: str = "") -> dict:
     """Build a filtered environment dict for stdio subprocesses.
 
     Only passes through safe baseline variables (PATH, HOME, etc.) and XDG_*
@@ -435,6 +475,10 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             or key.startswith("XDG_")
         ):
             env[key] = value
+    # Coerce defensively: a quoted YAML env block arrives as a str, and
+    # dict.update(str) raises the "dictionary update sequence element #0 has
+    # length 1" crash-retry loop this guards against.
+    user_env = _coerce_config_json(server_name, "env", user_env, dict, {})
     if user_env:
         env.update(user_env)
     return env
@@ -700,6 +744,22 @@ class NonMcpEndpointError(ConnectionError):
 
     Subclasses :class:`ConnectionError` so callers that only catch the broad
     class still treat it as a connection problem.
+    """
+
+
+class NonRetryableConfigError(ValueError):
+    """Deterministic pre-transport config failure (bad types/values in the
+    server's config.yaml entry), raised BEFORE any subprocess or network
+    transport exists. Subclasses :class:`ValueError` so existing callers that
+    catch the broad class keep working.
+
+    Retrying cannot succeed — the inputs come straight from config — so
+    ``run()`` parks the server WITHOUT the periodic 300s self-probe. Observed
+    trigger: a quoted YAML ``env`` block arrives as a *string*, and
+    ``dict.update(str)`` raised "dictionary update sequence element #0 has
+    length 1" on every connect; the parked self-probe then replayed the exact
+    same crash every 5 minutes forever. A manual ``/mcp`` refresh (explicit
+    reconnect) still revives the server after the config is fixed.
     """
 
 
@@ -1903,16 +1963,30 @@ class MCPServerTask:
             )
 
         command = config.get("command")
-        args = config.get("args", [])
+        # Coerce env/args that arrive as quoted YAML strings (see
+        # _coerce_config_json): the raw values crashed pre-spawn with
+        # "dictionary update sequence element #0 has length 1" and put the
+        # server into a permanent crash-retry loop.
+        args = _coerce_config_json(self.name, "args", config.get("args", []), list, [])
         user_env = config.get("env")
 
         if not command:
-            raise ValueError(
+            # Deterministic config problem — parking without the periodic
+            # self-probe (see NonRetryableConfigError) instead of retrying
+            # the same missing key every 5 minutes.
+            raise NonRetryableConfigError(
                 f"MCP server '{self.name}' has no 'command' in config"
             )
 
-        safe_env = _build_safe_env(user_env)
-        command, safe_env = _resolve_stdio_command(command, safe_env)
+        try:
+            safe_env = _build_safe_env(user_env, self.name)
+            command, safe_env = _resolve_stdio_command(command, safe_env)
+        except (TypeError, ValueError) as exc:
+            # Still pre-spawn: bad config types are deterministic, so retrying
+            # replays the exact same crash. Tag for the non-retryable park.
+            raise NonRetryableConfigError(
+                f"MCP server '{self.name}': invalid config: {exc}"
+            ) from exc
 
         # Check package against OSV malware database before spawning.
         # Run off the event loop (the urllib HTTPS call is blocking) and bound
@@ -1933,15 +2007,24 @@ class MCPServerTask:
             )
             malware_error = None
         if malware_error:
-            raise ValueError(
+            # A positive malware verdict is deterministic for this package —
+            # never re-probe it on a timer.
+            raise NonRetryableConfigError(
                 f"MCP server '{self.name}': {malware_error}"
             )
 
-        server_params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=safe_env if safe_env else None,
-        )
+        try:
+            server_params = StdioServerParameters(
+                command=command,
+                args=args,
+                env=safe_env if safe_env else None,
+            )
+        except (TypeError, ValueError) as exc:
+            # pydantic ValidationError subclasses ValueError: wrong types for
+            # command/args/env are a config problem, raised before any spawn.
+            raise NonRetryableConfigError(
+                f"MCP server '{self.name}': invalid stdio parameters: {exc}"
+            ) from exc
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
         if self._elicitation:
@@ -2575,6 +2658,39 @@ class MCPServerTask:
                         self._error = exc
                         self._ready.set()
                         return
+
+                    if isinstance(exc, NonRetryableConfigError):
+                        # Deterministic pre-transport error (bad config
+                        # types/values, nothing was spawned): park WITHOUT the
+                        # periodic self-probe. The timed park below replayed a
+                        # pure config-parse crash every 300s forever; only an
+                        # explicit reconnect (manual /mcp refresh after fixing
+                        # config.yaml) can change the outcome, so that is the
+                        # only wake-up we wait for.
+                        logger.warning(
+                            "MCP server '%s' has an invalid config entry, "
+                            "parking without periodic retry (fix config.yaml "
+                            "and refresh /mcp to revive): %s",
+                            self.name, exc,
+                        )
+                        self._error = exc
+                        self._ready.set()
+                        self._deregister_tools()
+                        self._reconnect_event.clear()
+                        parked = await self._wait_for_reconnect_or_shutdown()
+                        if parked == "shutdown":
+                            return
+                        logger.info(
+                            "MCP server '%s': explicit reconnect requested "
+                            "after config error; rebuilding transport.",
+                            self.name,
+                        )
+                        initial_retries = 0
+                        self._reconnect_retries = 0
+                        backoff = 1.0
+                        self._error = None
+                        self._ready.clear()
+                        continue
 
                     initial_retries += 1
                     if initial_retries > _MAX_INITIAL_CONNECT_RETRIES:

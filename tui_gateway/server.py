@@ -27,7 +27,7 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
-from tui_gateway import git_probe
+from tui_gateway import diagnostics, git_probe
 from tui_gateway.transport import (
     StdioTransport,
     Transport,
@@ -1145,6 +1145,15 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     return rid, method, params
 
 
+# Queue delay (ms) the current request spent waiting on the RPC pool before
+# its handler started. Set by dispatch()'s pool path (each pool run executes
+# in a copied context, so values never leak between requests); inline
+# fast-path handlers see the 0.0 default.
+_rpc_queue_ms: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "rpc_queue_ms", default=0.0
+)
+
+
 def handle_request(req: dict) -> dict | None:
     normalized = _normalize_request(req)
     if isinstance(normalized, dict):
@@ -1154,7 +1163,30 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    return fn(rid, params)
+    # Perf diagnostics: time every RPC (pool queue delay rides in via the
+    # contextvar above). gui.log showed 8-63s event-loop stalls ("GIL
+    # pressure suspected") with no record of WHICH handlers were burning the
+    # time — diagnostics.perf reports it from this hook.
+    start = time.perf_counter()
+    ok = True
+    try:
+        resp = fn(rid, params)
+        if isinstance(resp, dict) and resp.get("error") is not None:
+            ok = False
+        return resp
+    except BaseException:
+        ok = False
+        raise
+    finally:
+        try:
+            diagnostics.record_rpc(
+                method,
+                (time.perf_counter() - start) * 1000.0,
+                _rpc_queue_ms.get(),
+                ok,
+            )
+        except Exception:
+            pass
 
 
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
@@ -1182,8 +1214,14 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
+        # Stamp submit time so diagnostics can separate "sat queued behind
+        # other long handlers" from "the handler itself was slow" — under the
+        # observed GIL-pressure stalls the queue delay is often the larger
+        # component and is invisible to per-handler timing alone.
+        submitted = time.perf_counter()
 
         def run():
+            _rpc_queue_ms.set((time.perf_counter() - submitted) * 1000.0)
             try:
                 resp = handle_request(req)
             except Exception as exc:
@@ -1244,7 +1282,6 @@ def _start_agent_build(sid: str, session: dict) -> None:
             ready.set()
             return
 
-        worker = None
         notify_registered = False
         home_token = None
         profile_home = current.get("profile_home")
@@ -1287,7 +1324,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                _t_ctor = time.perf_counter()
                 agent = _make_agent(sid, key, **kw)
+                diagnostics.record_stage(
+                    "agent.build",
+                    "agent_ctor",
+                    (time.perf_counter() - _t_ctor) * 1000.0,
+                )
             finally:
                 _clear_session_context(tokens)
 
@@ -1298,12 +1341,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
 
-            try:
-                worker = _SlashWorker(key, getattr(agent, "model", _resolve_model()))
-                _attach_worker(sid, current, worker)
-            except Exception:
-                pass
-
+            # No eager _SlashWorker here: each worker is a full Python
+            # subprocess (~50MB RSS, ~1%/core idle), and spawning one per
+            # session create/cold-resume fed the process's GIL-pressure event-
+            # loop stalls. slash.exec lazily spawns a worker on the first
+            # slash command, so nothing is lost for sessions that never run
+            # one (session['slash_worker'] stays None until then).
+            _t_wire = time.perf_counter()
             try:
                 from tools.approval import (
                     register_gateway_notify,
@@ -1345,13 +1389,20 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
             _notify_session_boundary("on_session_reset", key)
+            diagnostics.record_stage(
+                "agent.build", "wire", (time.perf_counter() - _t_wire) * 1000.0
+            )
 
+            _t_info = time.perf_counter()
             info = _session_info(agent, current)
             cfg_warn = _probe_config_health(_load_cfg())
             if cfg_warn:
                 info["config_warning"] = cfg_warn
                 logger.warning(cfg_warn)
             _emit("session.info", sid, info)
+            diagnostics.record_stage(
+                "agent.build", "info", (time.perf_counter() - _t_info) * 1000.0
+            )
             # If MCP discovery is still in flight (a server slower than the
             # bounded wait_for_mcp_discovery join in _make_agent), the agent
             # was built without those tools. Catch up once they land — see
@@ -1363,9 +1414,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
-            # _attach_worker already closed the worker if this session was
-            # reaped mid-build; only the late notify registration can still
-            # leak (session.close unregistered before _build registered it).
+            # No slash worker is spawned during the build anymore (slash.exec
+            # lazily creates one on first use); only the late notify
+            # registration can still leak (session.close unregistered before
+            # _build registered it).
             with _sessions_lock:
                 replaced = _sessions.get(sid) is not current
             if replaced and notify_registered:
@@ -4310,6 +4362,7 @@ def _make_agent(
     # to land before building — bounded, so a slow/dead server still can't
     # block. Dashboard /api/ws uses hermes_cli.mcp_startup; TUI stdio keeps
     # its existing tui_gateway.entry-owned thread.
+    _t_mcp = time.perf_counter()
     try:
         from hermes_cli.mcp_startup import wait_for_mcp_discovery
 
@@ -4322,6 +4375,12 @@ def _make_agent(
         wait_for_mcp_discovery()
     except Exception:
         pass
+    # Recorded as its own stage (note: agent_ctor timings in the deferred
+    # build wrap the whole _make_agent call, so they INCLUDE this wait) —
+    # a slow MCP server here is a common cause of long build times.
+    diagnostics.record_stage(
+        "agent.build", "mcp_discovery", (time.perf_counter() - _t_mcp) * 1000.0
+    )
 
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
@@ -4510,15 +4569,10 @@ def _init_session(
             except Exception:
                 logger.debug("failed to persist resumed session cwd", exc_info=True)
     _register_session_cwd(_sessions[sid])
-    try:
-        _attach_worker(
-            sid,
-            _sessions[sid],
-            _SlashWorker(key, getattr(agent, "model", _resolve_model())),
-        )
-    except Exception:
-        # Defer hard-failure to slash.exec; chat still works without slash worker.
-        _sessions[sid]["slash_worker"] = None
+    # slash_worker stays None (set in the session record above): each worker
+    # is a full Python subprocess (~50MB RSS, ~1%/core idle), and eagerly
+    # spawning one per session create/resume fed the process's GIL-pressure
+    # event-loop stalls. slash.exec lazily spawns one on first slash use.
     try:
         from tools.approval import register_gateway_notify, load_permanent_allowlist
 
@@ -5028,10 +5082,15 @@ def _(rid, params: dict) -> dict:
 
     ready = threading.Event()
     now = time.time()
+    _t_stage = time.perf_counter()
     lease, limit_message = _claim_active_session_slot(key, live_session_id=sid)
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
+    diagnostics.record_stage(
+        "session.create", "claim", (time.perf_counter() - _t_stage) * 1000.0
+    )
 
+    _t_stage = time.perf_counter()
     with _sessions_lock:
         _sessions[sid] = {
             "agent": None,
@@ -5067,6 +5126,9 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
+    diagnostics.record_stage(
+        "session.create", "insert", (time.perf_counter() - _t_stage) * 1000.0
+    )
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -5082,7 +5144,8 @@ def _(rid, params: dict) -> dict:
     _schedule_agent_build(sid)
     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
-    return _ok(
+    _t_stage = time.perf_counter()
+    response = _ok(
         rid,
         {
             "session_id": sid,
@@ -5107,13 +5170,22 @@ def _(rid, params: dict) -> dict:
                 "tools": {},
                 "skills": {},
                 "cwd": _sessions[sid]["cwd"],
-                "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
+                # Intentionally empty on the response path: computing it here
+                # spawned up to two 1.5s-timeout git subprocesses inline per
+                # create RPC, feeding the observed event-loop stalls. The
+                # deferred build's session.info recomputes the branch off-path
+                # moments later, so the client self-heals.
+                "branch": "",
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _current_profile_name(),
             },
         },
     )
+    diagnostics.record_stage(
+        "session.create", "respond", (time.perf_counter() - _t_stage) * 1000.0
+    )
+    return response
 
 
 @method("session.list")
@@ -5248,12 +5320,35 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"verification": {"status": "unknown", "evidence": None}})
 
 
+@method("diagnostics.perf")
+def _(rid, params: dict) -> dict:
+    """In-process performance snapshot: per-RPC timings (run + pool queue),
+    the slowest calls, event-loop lag from the heartbeat watchdog, and named
+    create/resume/build stage timings.
+
+    Added to make the production 'event loop stalled Ns (GIL pressure
+    suspected)' bursts diagnosable through the API instead of via log
+    archaeology. Read-only, in-memory, fast — intentionally NOT in
+    _LONG_HANDLERS so it stays answerable even while the pool is saturated
+    (that saturation is often what's being diagnosed).
+    """
+    try:
+        return _ok(rid, diagnostics.snapshot())
+    except Exception as e:
+        return _err(rid, 5000, f"diagnostics snapshot failed: {e}")
+
+
 def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
     info = {
         "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
+        # Intentionally empty on the response path: git_probe.branch() can
+        # spawn up to two 1.5s-timeout git subprocesses, and this info is
+        # built inline in session.resume responses (part of the observed
+        # event-loop stalls). The deferred build's session.info recomputes
+        # the branch off-path, so the client self-heals.
+        "branch": "",
         "model": model or _resolve_model(),
         "tools": {},
         "skills": {},
@@ -5352,6 +5447,19 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     timer.start()
 
 
+# session.resume transcript shaping. Serializing a huge display transcript
+# (_history_to_messages + the JSON write) runs inline on the response path;
+# clients that only need to paint the tail (or nothing, e.g. a background
+# reattach) can opt out of the full payload. Default 'full' keeps every
+# existing caller byte-identical.
+_TRANSCRIPT_TAIL_ENTRIES = 50
+
+
+def _transcript_mode(params: dict) -> str:
+    mode = str(params.get("transcript_mode") or "full").strip().lower()
+    return mode if mode in {"full", "tail", "none"} else "full"
+
+
 @method("session.resume")
 def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
@@ -5377,6 +5485,8 @@ def _(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
+    resume_transcript_mode = _transcript_mode(params)
+    _t_stage = time.perf_counter()
     found = db.get_session(target)
     if not found:
         found = db.get_session_by_title(target)
@@ -5417,6 +5527,9 @@ def _(rid, params: dict) -> dict:
         if tip and tip != target:
             target = tip
             found = db.get_session(target) or found
+    diagnostics.record_stage(
+        "session.resume", "db_lookup", (time.perf_counter() - _t_stage) * 1000.0
+    )
 
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
@@ -5429,6 +5542,7 @@ def _(rid, params: dict) -> dict:
             cols=cols,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            transcript_mode=resume_transcript_mode,
         )
         payload["resumed"] = target
         # A lazy watch session never owns a run loop, so its payload's running
@@ -5521,19 +5635,42 @@ def _(rid, params: dict) -> dict:
         # Interactive resume routes approvals/clarify through gateway prompts;
         # the deferred build wires the remaining per-session callbacks.
         _enable_gateway_prompts()
+        _t_stage = time.perf_counter()
         try:
             db.reopen_session(target)
-            raw_history = db.get_messages_as_conversation(target)
-            display_history = db.get_messages_as_conversation(target, include_ancestors=True)
+            # ONE transcript read instead of two. This used to fetch the
+            # session's own rows AND the ancestor-inclusive transcript as two
+            # full get_messages_as_conversation() calls, but the raw history
+            # is by construction the suffix of the display transcript that
+            # belongs to ``target`` itself (the old prefix math already
+            # assumed exactly that) — so derive the split point from a cheap
+            # COUNT of ancestor rows and slice. On long sessions the duplicate
+            # read/decode doubled resume DB time under the same DB lock the
+            # agent's writes use, feeding the 8-63s event-loop stalls logged
+            # as 'GIL pressure suspected'. Sessions with no ancestors get
+            # prefix 0, i.e. identical semantics.
+            display_history = db.get_messages_as_conversation(
+                target, include_ancestors=True
+            )
+            prefix_len = min(
+                db.count_ancestor_messages(target), len(display_history)
+            )
         except Exception as e:
             if lease is not None:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
+        diagnostics.record_stage(
+            "session.resume", "db_read", (time.perf_counter() - _t_stage) * 1000.0
+        )
         # Display keeps the full transcript; the model-fed history drops a
         # dangling/interrupted tool-call tail so a session killed mid-loop does
         # not replay the unanswered call forever (#29086).
-        prefix = display_history[: max(0, len(display_history) - len(raw_history))]
-        history = sanitize_replay_history(raw_history)
+        _t_stage = time.perf_counter()
+        prefix = display_history[:prefix_len]
+        history = sanitize_replay_history(display_history[prefix_len:])
+        diagnostics.record_stage(
+            "session.resume", "sanitize", (time.perf_counter() - _t_stage) * 1000.0
+        )
         # Restore the model/provider/reasoning/tier this chat last used so the
         # deferred build (and the info below) match the eager path — without them
         # the build drops the provider ("No LLM provider configured").
@@ -5559,26 +5696,46 @@ def _(rid, params: dict) -> dict:
         _schedule_agent_build(sid)
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
-        messages = _history_to_messages(display_history)
-        return _ok(
-            rid,
-            {
-                "session_id": sid,
-                "resumed": target,
-                "message_count": len(messages),
-                "messages": messages,
-                "info": _lazy_resume_info(
-                    cwd,
-                    model=model_override.get("model") or "",
-                    provider=overrides.get("provider_override") or "",
-                ),
-                "inflight": None,
-                "running": False,
-                "session_key": target,
-                "started_at": record["created_at"],
-                "status": "idle",
-            },
+        # transcript_mode: 'tail' serializes only the last entries, 'none'
+        # skips serialization entirely — for huge transcripts the
+        # _history_to_messages + JSON write below is the dominant cost of
+        # this response. Default 'full' stays byte-identical (including
+        # message_count == len(messages)); truncated modes report the TOTAL
+        # display-entry count instead so clients can still show it.
+        _t_stage = time.perf_counter()
+        if resume_transcript_mode == "none":
+            shown: list = []
+        elif resume_transcript_mode == "tail":
+            shown = display_history[-_TRANSCRIPT_TAIL_ENTRIES:]
+        else:
+            shown = display_history
+        messages = _history_to_messages(shown)
+        result = {
+            "session_id": sid,
+            "resumed": target,
+            "message_count": (
+                len(messages)
+                if resume_transcript_mode == "full"
+                else len(display_history)
+            ),
+            "messages": messages,
+            "info": _lazy_resume_info(
+                cwd,
+                model=model_override.get("model") or "",
+                provider=overrides.get("provider_override") or "",
+            ),
+            "inflight": None,
+            "running": False,
+            "session_key": target,
+            "started_at": record["created_at"],
+            "status": "idle",
+        }
+        if resume_transcript_mode != "full":
+            result["transcript_truncated"] = True
+        diagnostics.record_stage(
+            "session.resume", "serialize", (time.perf_counter() - _t_stage) * 1000.0
         )
+        return _ok(rid, result)
 
     # Build the agent OUTSIDE the lock — _make_agent can block for seconds
     # (MCP discovery, prompt/skill build, AIAgent construction). Holding
@@ -5840,6 +5997,7 @@ def _live_session_payload(
     cols: int | None = None,
     touch: bool = False,
     transport: Transport | None = None,
+    transcript_mode: str = "full",
 ) -> dict:
     with session["history_lock"]:
         if cols is not None:
@@ -5853,16 +6011,28 @@ def _live_session_payload(
         )
         inflight = _inflight_snapshot(session)
         running = bool(session.get("running"))
+    # transcript_mode (session.resume): 'tail' serializes only the last
+    # display entries, 'none' skips serialization entirely. message_count
+    # always reports the TOTAL display entries so clients can still show
+    # counts. Default 'full' is byte-identical to the historical payload.
+    if transcript_mode == "none":
+        shown: list = []
+    elif transcript_mode == "tail":
+        shown = history[-_TRANSCRIPT_TAIL_ENTRIES:]
+    else:
+        shown = history
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
-        "messages": _history_to_messages(history),
+        "messages": _history_to_messages(shown),
         "running": running,
         "session_id": sid,
         "session_key": _session_lookup_key(session, fallback=sid),
         "started_at": float(session.get("created_at") or time.time()),
         "status": _session_live_status(sid, session),
     }
+    if transcript_mode != "full":
+        payload["transcript_truncated"] = True
     if inflight:
         payload["inflight"] = inflight
     return payload
