@@ -1104,6 +1104,14 @@ DEFAULT_CONFIG = {
         # (Telegram, Discord, etc.) where the verification narrative would reach
         # a human as chat noise. Doc/markdown/skill-only edits never fire it.
         # Set true to force on everywhere, or false to disable.
+        # "strict" (CODING-HARNESS-REVIEW-2026-07-16 §3.1, Codex parity) is the
+        # opt-in hard gate: forces the check on everywhere and, after code
+        # edits, keeps refusing turn completion until fresh PASSING evidence
+        # exists — asserting a blocker no longer releases it. Bounded escape
+        # hatch: after 8 continuation attempts the turn releases with a loud
+        # unverified-warning banner instead of spinning forever (see
+        # agent/verification_stop.py STRICT_VERIFY_MAX_ATTEMPTS). Every other
+        # value keeps today's soft 2-nudge behavior exactly.
         "verify_on_stop": "auto",
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
@@ -1362,6 +1370,24 @@ DEFAULT_CONFIG = {
     # exceed this are rejected with guidance to use offset+limit.
     # 100K chars ≈ 25–35K tokens across typical tokenisers.
     "file_read_max_chars": 100_000,
+
+    # CODING-HARNESS-REVIEW-2026-07-16 §3.2 — hard read-before-edit gate.
+    # Default False: editing (write_file/patch) an existing file this session
+    # never read only attaches a soft ``_warning``, exactly as before.  Set
+    # True to hard-ERROR instead (Claude Code behavior): the model must
+    # read_file the target first; creating a NEW file stays allowed.
+    # Env override: HERMES_FILE_EDIT_REQUIRE_READ=1/0 (wins in both
+    # directions).  See tools/file_tools._read_before_edit_error.
+    "file_edit_require_read": False,
+
+    # CODING-HARNESS-REVIEW-2026-07-16 §3.3 — strict-exact patch matching.
+    # Default False: the patch tool's 9-strategy fuzzy chain (see
+    # tools/fuzzy_match.py) may apply an edit via a non-exact match; the
+    # result now names the strategy + line whenever that happens, but the
+    # edit still lands.  Set True to REJECT any non-exact match with an
+    # error naming the nearest match instead of applying it.  Env override:
+    # HERMES_FILE_EDIT_STRICT_EXACT=1/0 (wins in both directions).
+    "file_edit_strict_exact": False,
 
     # Seconds to wait at agent-build time for in-flight MCP server discovery
     # to finish before the agent snapshots its tool list.  MCP discovery runs

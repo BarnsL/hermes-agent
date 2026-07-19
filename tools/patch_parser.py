@@ -240,6 +240,7 @@ def _count_occurrences(text: str, pattern: str) -> int:
 def _validate_operations(
     operations: List[PatchOperation],
     file_ops: Any,
+    strict_exact: bool = False,
 ) -> List[str]:
     """Validate all operations without writing any files.
 
@@ -248,6 +249,12 @@ def _validate_operations(
 
     For UPDATE operations, hunks are simulated in order so that later
     hunks validate against post-earlier-hunk content (matching apply order).
+
+    ``strict_exact`` (CODING-HARNESS-REVIEW-2026-07-16 §3.3, opt-in via
+    ``file_edit_strict_exact``): a hunk that only matches via a non-exact
+    fuzzy strategy is a validation ERROR — the two-phase design means the
+    whole patch is rejected here before anything touches disk, mirroring
+    the strict-exact rejection in ``patch_replace``.
     """
     # Deferred import: breaks the patch_parser ↔ fuzzy_match circular dependency
     from tools.fuzzy_match import fuzzy_find_and_replace
@@ -310,6 +317,29 @@ def _validate_operations(
                     except Exception:
                         pass
                     errors.append(msg)
+                elif strict_exact and _strategy is not None and _strategy != "exact":
+                    # CODING-HARNESS-REVIEW-2026-07-16 §3.3: strict-exact mode
+                    # rejects fuzzy-only matches at validation time (nothing
+                    # written yet).  Name the strategy and where it landed so
+                    # the model can re-read and emit the verbatim hunk text.
+                    # Don't advance ``simulated`` — same treatment as the
+                    # not-found branch above, since the hunk is being refused.
+                    try:
+                        from tools.fuzzy_match import fuzzy_find_matches, line_of_offset
+                        _, _spans = fuzzy_find_matches(simulated, search_pattern)
+                        _where = (
+                            f" at line {line_of_offset(simulated, _spans[0][0])}"
+                            if _spans else ""
+                        )
+                    except Exception:
+                        _where = ""
+                    errors.append(
+                        f"{op.file_path}: hunk {hunk_index} only matched via the "
+                        f"'{_strategy}' fuzzy strategy{_where} — strict-exact "
+                        "mode rejects non-exact matches. Re-read the file and "
+                        "emit the hunk's context/removed lines exactly as they "
+                        "appear on disk. (file_edit_strict_exact is enabled.)"
+                    )
                 else:
                     # Advance simulation so subsequent hunks validate correctly.
                     # Reuse the result from the call above — no second fuzzy run.
@@ -342,7 +372,8 @@ def _validate_operations(
 
 
 def apply_v4a_operations(operations: List[PatchOperation],
-                          file_ops: Any) -> 'PatchResult':
+                          file_ops: Any,
+                          strict_exact: bool = False) -> 'PatchResult':
     """Apply V4A patch operations using a file operations interface.
 
     Uses a two-phase validate-then-apply approach:
@@ -355,6 +386,9 @@ def apply_v4a_operations(operations: List[PatchOperation],
     Args:
         operations: List of PatchOperation from parse_v4a_patch
         file_ops: Object with read_file_raw, write_file methods
+        strict_exact: Opt-in (CODING-HARNESS-REVIEW-2026-07-16 §3.3) — hunks
+            that only match via a non-exact fuzzy strategy fail phase-1
+            validation, so the whole patch is rejected with no writes.
 
     Returns:
         PatchResult with results of all operations
@@ -363,7 +397,8 @@ def apply_v4a_operations(operations: List[PatchOperation],
     from tools.file_operations import PatchResult
 
     # ---- Phase 1: validate ----
-    validation_errors = _validate_operations(operations, file_ops)
+    validation_errors = _validate_operations(operations, file_ops,
+                                             strict_exact=strict_exact)
     if validation_errors:
         return PatchResult(
             success=False,
@@ -413,7 +448,11 @@ def apply_v4a_operations(operations: List[PatchOperation],
                     errors.append(f"Failed to move {op.file_path}: {result[1]}")
 
             elif op.operation == OperationType.UPDATE:
-                result = _apply_update(op, file_ops)
+                # strict_exact rides along for the post-validation race case:
+                # if the file changed between phase 1 and here such that a
+                # hunk now only matches fuzzily, strict mode still refuses to
+                # apply it rather than silently degrading to a fuzzy edit.
+                result = _apply_update(op, file_ops, strict_exact=strict_exact)
                 if result[0]:
                     files_modified.append(op.file_path)
                     all_diffs.append(result[1])
@@ -524,11 +563,20 @@ def _apply_move(op: PatchOperation, file_ops: Any) -> Tuple[bool, str]:
     return True, diff
 
 
-def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optional[str]]:
+def _apply_update(op: PatchOperation, file_ops: Any,
+                  strict_exact: bool = False) -> Tuple[bool, str, Optional[str]]:
     """Apply an update file operation.
 
     Returns ``(success, diff_or_error, lsp_diagnostics)`` — see
     :func:`_apply_add` for the rationale on the third element.
+
+    ``strict_exact`` (CODING-HARNESS-REVIEW-2026-07-16 §3.3): refuse hunks
+    that only match via a non-exact fuzzy strategy.  Normally phase-1
+    validation already caught this; here it only fires on a validate/apply
+    race.  Independently of the flag, any hunk that DID apply via a
+    non-exact strategy gets a ``[match note: ...]`` line appended to the
+    diff naming the strategy and line, so silent wrong-location fuzzy edits
+    are visible in the tool result.
     """
     # Deferred import: breaks the patch_parser ↔ fuzzy_match circular dependency
     from tools.fuzzy_match import fuzzy_find_and_replace
@@ -544,7 +592,22 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
     # Apply each hunk
     new_content = current_content
 
-    for hunk in op.hunks:
+    # (hunk_index, strategy, line) for hunks applied via a non-exact
+    # strategy — surfaced as [match note: ...] lines under the diff.
+    fuzzy_applied: List[Tuple[int, str, Optional[int]]] = []
+
+    def _match_line(pre_content: str, pattern: str, line_offset: int = 0) -> Optional[int]:
+        """Best-effort line number of the span the fuzzy chain matched."""
+        try:
+            from tools.fuzzy_match import fuzzy_find_matches, line_of_offset
+            _, spans = fuzzy_find_matches(pre_content, pattern)
+            if spans:
+                return line_of_offset(pre_content, spans[0][0]) + line_offset
+        except Exception:
+            pass
+        return None
+
+    for hunk_index, hunk in enumerate(op.hunks, start=1):
         # Build search pattern from context and removed lines
         search_lines = []
         replace_lines = []
@@ -564,9 +627,25 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
             search_pattern = '\n'.join(search_lines)
             replacement = '\n'.join(replace_lines)
 
+            # Snapshot pre-hunk content so the match note below can report
+            # the line the fuzzy chain matched IN THE CONTENT IT SEARCHED
+            # (positions in new_content shift as hunks apply).
+            _pre_hunk = new_content
             new_content, count, _strategy, error = fuzzy_find_and_replace(
                 new_content, search_pattern, replacement, replace_all=False
             )
+            if count > 0 and _strategy is not None and _strategy != "exact":
+                if strict_exact:
+                    # Validate/apply race: the file matched exactly in phase 1
+                    # but only fuzzily now.  Refuse rather than degrade.
+                    return False, (
+                        f"hunk {hunk_index} only matched via the '{_strategy}' "
+                        "fuzzy strategy — strict-exact mode rejects non-exact "
+                        "matches. (file_edit_strict_exact is enabled.)"
+                    ), None
+                fuzzy_applied.append(
+                    (hunk_index, _strategy, _match_line(_pre_hunk, search_pattern))
+                )
 
             if error and count == 0:
                 # Try with context hint if available
@@ -582,11 +661,27 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
                         window_new, count, _strategy, error = fuzzy_find_and_replace(
                             window, search_pattern, replacement, replace_all=False
                         )
-                        
+
                         if count > 0:
+                            if _strategy is not None and _strategy != "exact":
+                                if strict_exact:
+                                    return False, (
+                                        f"hunk {hunk_index} only matched via the "
+                                        f"'{_strategy}' fuzzy strategy (context-hint "
+                                        "window) — strict-exact mode rejects "
+                                        "non-exact matches. "
+                                        "(file_edit_strict_exact is enabled.)"
+                                    ), None
+                                # Window positions are window-relative; add the
+                                # lines preceding the window for a file line.
+                                _win_offset = new_content.count("\n", 0, window_start)
+                                fuzzy_applied.append((
+                                    hunk_index, _strategy,
+                                    _match_line(window, search_pattern, _win_offset),
+                                ))
                             new_content = new_content[:window_start] + window_new + new_content[window_end:]
                             error = None
-                
+
                 if error:
                     err_msg = f"Could not apply hunk: {error}"
                     try:
@@ -633,5 +728,18 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
         tofile=f"b/{op.file_path}"
     )
     diff = ''.join(diff_lines)
-    
+
+    # CODING-HARNESS-REVIEW-2026-07-16 §3.3: name any non-exact strategy in
+    # the result.  Appended to the diff (the only string this return shape
+    # carries back through apply_v4a_operations) so the note reaches the
+    # model without changing the (success, diff, lsp) tuple contract.
+    if fuzzy_applied:
+        notes = "\n".join(
+            f"[match note: hunk {idx} applied via {strat} match"
+            + (f" at line {line}" if line is not None else "")
+            + " — not an exact match; verify placement]"
+            for idx, strat, line in fuzzy_applied
+        )
+        diff = (diff + "\n" if diff else diff) + notes
+
     return True, diff, getattr(write_result, "lsp_diagnostics", None)

@@ -715,3 +715,97 @@ class TestV4ALspDiagnosticsPropagation:
         assert result.lsp_diagnostics is not None
         assert per_file["a.ts"] in result.lsp_diagnostics
         assert per_file["b.ts"] in result.lsp_diagnostics
+
+
+class TestV4AStrictExactAndMatchNotes:
+    """CODING-HARNESS-REVIEW-2026-07-16 §3.3 for the V4A path: hunks applied
+    via a non-exact fuzzy strategy are named in the diff, and
+    strict_exact=True rejects them at validation time with no writes."""
+
+    def _fake_ops(self, content):
+        class FakeFileOps:
+            def __init__(self):
+                self.written = None
+                self.content = content
+
+            def read_file_raw(self, path):
+                return SimpleNamespace(content=self.content, error=None)
+
+            def write_file(self, path, content):
+                self.written = content
+                return SimpleNamespace(error=None)
+
+        return FakeFileOps()
+
+    # File is 4-space indented; the hunk's lines arrive 2-space indented.
+    # The context line makes the search pattern multi-line
+    # ("def foo():\n  return 1"), which is NOT an exact substring of the
+    # 4-space file — a bare single-line "  return 1" WOULD be (substring
+    # of "    return 1"), which is exactly the silent-fuzzy trap §3.3 is
+    # about.  Only the line_trimmed strategy matches this pattern.
+    _FUZZY_PATCH = (
+        "*** Begin Patch\n"
+        "*** Update File: sample.py\n"
+        "@@ def foo @@\n"
+        " def foo():\n"
+        "-  return 1\n"
+        "+  return 2\n"
+        "*** End Patch"
+    )
+    _CONTENT = "def foo():\n    return 1\n"
+
+    def test_non_exact_hunk_named_in_diff(self):
+        ops, err = parse_v4a_patch(self._FUZZY_PATCH)
+        assert err is None
+        fo = self._fake_ops(self._CONTENT)
+        result = apply_v4a_operations(ops, fo)
+        assert result.success is True
+        assert fo.written is not None and "return 2" in fo.written
+        assert "match note" in result.diff
+        assert "line_trimmed" in result.diff
+        assert "hunk 1" in result.diff
+
+    def test_exact_hunk_has_no_match_note(self):
+        exact_patch = (
+            "*** Begin Patch\n"
+            "*** Update File: sample.py\n"
+            "@@ def foo @@\n"
+            " def foo():\n"
+            "-    return 1\n"
+            "+    return 2\n"
+            "*** End Patch"
+        )
+        ops, err = parse_v4a_patch(exact_patch)
+        assert err is None
+        fo = self._fake_ops(self._CONTENT)
+        result = apply_v4a_operations(ops, fo)
+        assert result.success is True
+        assert "match note" not in result.diff
+
+    def test_strict_exact_rejects_fuzzy_hunk_with_no_writes(self):
+        ops, err = parse_v4a_patch(self._FUZZY_PATCH)
+        assert err is None
+        fo = self._fake_ops(self._CONTENT)
+        result = apply_v4a_operations(ops, fo, strict_exact=True)
+        assert result.success is False
+        assert result.error is not None
+        assert "strict-exact" in result.error
+        assert "line_trimmed" in result.error
+        assert fo.written is None, "strict-exact rejection must not write"
+
+    def test_strict_exact_allows_exact_hunk(self):
+        exact_patch = (
+            "*** Begin Patch\n"
+            "*** Update File: sample.py\n"
+            "@@ def foo @@\n"
+            " def foo():\n"
+            "-    return 1\n"
+            "+    return 2\n"
+            "*** End Patch"
+        )
+        ops, err = parse_v4a_patch(exact_patch)
+        assert err is None
+        fo = self._fake_ops(self._CONTENT)
+        result = apply_v4a_operations(ops, fo, strict_exact=True)
+        assert result.success is True
+        assert fo.written is not None and "return 2" in fo.written

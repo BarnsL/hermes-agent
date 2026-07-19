@@ -720,7 +720,11 @@ agent:
   # coding surfaces (CLI, TUI, desktop) and programmatic callers, and disables
   # it on conversational messaging surfaces (Telegram, Discord, etc.) where the
   # verification summary would reach a human as chat noise. Set true or false to
-  # force it on or off; the HERMES_VERIFY_ON_STOP env var (1/0) takes precedence.
+  # force it on or off; the HERMES_VERIFY_ON_STOP env var (1/0/strict) takes
+  # precedence. Set "strict" for the Codex-style hard gate: after code edits,
+  # the turn cannot complete until fresh PASSING verification evidence exists
+  # (up to 8 forced continuations, then it releases with a loud
+  # unverified-warning banner so a genuinely blocked model can't spin forever).
   # verify_on_stop: auto
 
   # Standing operator instructions for the coding posture (when Hermes is in a
@@ -779,6 +783,24 @@ agent:
     uwu: "hewwo! i'm your fwiendwy assistant uwu~ i wiww twy my best to hewp you! *nuzzles your code* OwO what's this? wet me take a wook! i pwomise to be vewy hewpful >w<"
     philosopher: "Greetings, seeker of wisdom. I am an assistant who contemplates the deeper meaning behind every query. Let us examine not just the 'how' but the 'why' of your questions. Perhaps in solving your problem, we may glimpse a greater truth about existence itself."
     hype: "YOOO LET'S GOOOO!!! 🔥🔥🔥 I am SO PUMPED to help you today! Every question is AMAZING and we're gonna CRUSH IT together! This is gonna be LEGENDARY! ARE YOU READY?! LET'S DO THIS! 💪😤🚀"
+
+# =============================================================================
+# File Editing Precision (top-level keys, not under agent:)
+# =============================================================================
+# Hard read-before-edit gate. Default false: editing an existing file the
+# session never read only attaches a soft warning to the result. Set true to
+# hard-error instead (Claude Code behavior) so the model must read_file the
+# target before write_file/patch can touch it. Creating a NEW file is always
+# allowed. Env override: HERMES_FILE_EDIT_REQUIRE_READ=1/0 (wins both ways).
+# file_edit_require_read: false
+
+# Strict-exact patch matching. Default false: the patch tool's 9-strategy
+# fuzzy matcher may apply an edit via a non-exact match (whitespace/indent/
+# unicode drift etc.); the result names the strategy and line whenever that
+# happens so placement can be verified. Set true to REJECT any non-exact
+# match with an error naming the nearest match instead of applying it.
+# Env override: HERMES_FILE_EDIT_STRICT_EXACT=1/0 (wins both ways).
+# file_edit_strict_exact: false
 
 # =============================================================================
 # Toolsets

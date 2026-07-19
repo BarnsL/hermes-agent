@@ -5226,20 +5226,36 @@ def run_conversation(
 
                 try:
                     from agent.verification_stop import (
+                        STRICT_VERIFY_MAX_ATTEMPTS,
                         build_verify_on_stop_nudge,
                         verify_on_stop_enabled,
+                        verify_on_stop_strict,
                     )
 
                     if verify_on_stop_enabled():
+                        # CODING-HARNESS-REVIEW-2026-07-16 §3.1: opt-in strict
+                        # mode (agent.verify_on_stop: "strict") hard-blocks
+                        # completion after code edits — the soft 2-nudge cap
+                        # widens to STRICT_VERIFY_MAX_ATTEMPTS and a release at
+                        # that cap carries a loud warning banner (below).
+                        # Default config never resolves strict, so the 2-nudge
+                        # soft gate is preserved byte-for-byte.
+                        _verify_strict = verify_on_stop_strict()
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                             attempts=getattr(agent, "_verification_stop_nudges", 0),
+                            max_attempts=(
+                                STRICT_VERIFY_MAX_ATTEMPTS if _verify_strict else 2
+                            ),
+                            strict=_verify_strict,
                         )
                     else:
+                        _verify_strict = False
                         _verify_nudge = None
                 except Exception:
                     logger.debug("verification stop-loop check failed", exc_info=True)
+                    _verify_strict = False
                     _verify_nudge = None
 
                 if _verify_nudge:
@@ -5276,6 +5292,51 @@ def run_conversation(
                     _pending_verification_response = final_response
                     final_response = None
                     continue
+
+                # CODING-HARNESS-REVIEW-2026-07-16 §3.1: strict-mode escape
+                # hatch. Reaching here with the strict attempt cap consumed
+                # means the model spun through STRICT_VERIFY_MAX_ATTEMPTS
+                # continuations without producing fresh passing evidence (the
+                # nudge builder returned None on the attempts >= max_attempts
+                # bound, not on a fresh pass). Release the turn — a genuinely
+                # blocked model must not loop forever — but stamp a loud
+                # warning banner on the delivered message so the unverified
+                # answer can never masquerade as a verified one. The builder
+                # re-checks the ledger and returns None when evidence is now
+                # passing or the edits carry nothing verifiable, so a clean
+                # release stays banner-free. Mirrors the file-mutation
+                # verifier footer: only final_response is augmented, the
+                # durable transcript keeps the model's own text.
+                if (
+                    _verify_strict
+                    and final_response
+                    and getattr(agent, "_verification_stop_nudges", 0)
+                    >= STRICT_VERIFY_MAX_ATTEMPTS
+                ):
+                    try:
+                        from agent.verification_stop import (
+                            build_verify_on_stop_release_warning,
+                        )
+
+                        _verify_banner = build_verify_on_stop_release_warning(
+                            session_id=getattr(agent, "session_id", None),
+                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "strict verify release banner failed", exc_info=True
+                        )
+                        _verify_banner = None
+                    if _verify_banner:
+                        logger.warning(
+                            "strict verify-on-stop released without evidence "
+                            "after %d attempts (session=%s)",
+                            getattr(agent, "_verification_stop_nudges", 0),
+                            getattr(agent, "session_id", None) or "none",
+                        )
+                        final_response = (
+                            final_response.rstrip() + "\n\n" + _verify_banner
+                        )
 
                 # User verification-loop gate: when the agent edited code this
                 # turn, let a registered `pre_verify` hook (plugin/shell) keep it

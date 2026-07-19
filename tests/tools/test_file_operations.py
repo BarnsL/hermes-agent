@@ -891,6 +891,98 @@ class TestPatchReplacePostWriteVerification:
 
 
 # =========================================================================
+# Fuzzy-strategy surfacing + strict-exact (CODING-HARNESS-REVIEW-2026-07-16 §3.3)
+# =========================================================================
+
+def _stateful_shell(mock_env, initial_content):
+    """Wire mock_env so reads/writes round-trip through a content dict.
+
+    Same behavioral keying as TestPatchReplacePostWriteVerification: the
+    write is the only call that pipes content over stdin.
+    """
+    state = {"content": initial_content}
+
+    def side_effect(command, stdin_data=None, **kwargs):
+        if stdin_data is not None:
+            state["content"] = stdin_data
+            return {"output": "", "returncode": 0}
+        if command.startswith("cat "):
+            return {"output": state["content"], "returncode": 0}
+        if command.startswith("mkdir "):
+            return {"output": "", "returncode": 0}
+        if command.startswith("wc -c"):
+            return {"output": str(len(state["content"].encode())), "returncode": 0}
+        return {"output": "", "returncode": 0}
+
+    mock_env.execute.side_effect = side_effect
+    return state
+
+
+class TestFuzzyStrategySurfacing:
+    """The patch result must NAME any non-exact strategy that matched, and
+    strict_exact=True must reject non-exact matches instead of applying."""
+
+    def test_exact_match_has_no_match_note(self, mock_env):
+        state = _stateful_shell(mock_env, "hello world\n")
+        ops = ShellFileOperations(mock_env)
+        result = ops.patch_replace("/tmp/test/a.py", "hello", "hi")
+        assert result.error is None
+        assert result.match_note is None
+        assert "match_note" not in result.to_dict()
+        assert state["content"] == "hi world\n"
+
+    def test_non_exact_strategy_named_in_result(self, mock_env):
+        # File is 4-space indented; old_string arrives 2-space indented, so
+        # only the line_trimmed strategy matches.
+        state = _stateful_shell(mock_env, "def foo():\n    return 1\n")
+        ops = ShellFileOperations(mock_env)
+        result = ops.patch_replace(
+            "/tmp/test/a.py",
+            "def foo():\n  return 1",
+            "def foo():\n  return 2",
+        )
+        assert result.error is None, f"unexpected error: {result.error}"
+        assert result.match_note is not None
+        assert "line_trimmed" in result.match_note
+        assert "line 1" in result.match_note
+        assert "verify" in result.match_note.lower()
+        assert result.to_dict()["match_note"] == result.match_note
+        # The edit itself still applied (default behavior unchanged).
+        assert "return 2" in state["content"]
+
+    def test_strict_exact_rejects_non_exact_and_writes_nothing(self, mock_env):
+        state = _stateful_shell(mock_env, "def foo():\n    return 1\n")
+        ops = ShellFileOperations(mock_env)
+        result = ops.patch_replace(
+            "/tmp/test/a.py",
+            "def foo():\n  return 1",
+            "def foo():\n  return 2",
+            strict_exact=True,
+        )
+        assert result.error is not None
+        assert "strict-exact" in result.error
+        assert "line_trimmed" in result.error
+        assert "line 1" in result.error
+        # Nothing written — the file is untouched.
+        assert state["content"] == "def foo():\n    return 1\n"
+        assert result.success is False
+
+    def test_strict_exact_allows_exact_match(self, mock_env):
+        state = _stateful_shell(mock_env, "def foo():\n    return 1\n")
+        ops = ShellFileOperations(mock_env)
+        result = ops.patch_replace(
+            "/tmp/test/a.py",
+            "    return 1",
+            "    return 2",
+            strict_exact=True,
+        )
+        assert result.error is None, f"unexpected error: {result.error}"
+        assert result.success is True
+        assert result.match_note is None
+        assert "return 2" in state["content"]
+
+
+# =========================================================================
 # Git baseline check for write_file warning
 # =========================================================================
 

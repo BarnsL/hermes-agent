@@ -205,7 +205,14 @@ class PatchResult:
     # See :class:`WriteResult.lsp_diagnostics`.
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
-    
+    # CODING-HARNESS-REVIEW-2026-07-16 §3.3: names the fuzzy-match strategy
+    # (and its line) when the edit was applied by anything OTHER than an
+    # exact match.  Before this field existed, a strategy-4+ fuzzy match
+    # could land an edit at the wrong location and the result gave the
+    # model no signal to go verify placement.  ``None`` on exact matches
+    # so the common case stays noise-free.
+    match_note: Optional[str] = None
+
     def to_dict(self) -> dict:
         result = {"success": self.success}
         if self.diff:
@@ -222,6 +229,8 @@ class PatchResult:
             result["lsp_diagnostics"] = self.lsp_diagnostics
         if self.error:
             result["error"] = self.error
+        if self.match_note:
+            result["match_note"] = self.match_note
         return result
 
 
@@ -456,13 +465,24 @@ class FileOperations(ABC):
 
     @abstractmethod
     def patch_replace(self, path: str, old_string: str, new_string: str,
-                      replace_all: bool = False) -> PatchResult:
-        """Replace text in a file using fuzzy matching."""
+                      replace_all: bool = False,
+                      strict_exact: bool = False) -> PatchResult:
+        """Replace text in a file using fuzzy matching.
+
+        ``strict_exact`` (CODING-HARNESS-REVIEW-2026-07-16 §3.3, opt-in via
+        ``file_edit_strict_exact``): reject any match found by a non-exact
+        fuzzy strategy instead of applying it. Default False preserves the
+        historical fuzzy-apply behavior.
+        """
         ...
 
     @abstractmethod
-    def patch_v4a(self, patch_content: str) -> PatchResult:
-        """Apply a V4A format patch."""
+    def patch_v4a(self, patch_content: str, strict_exact: bool = False) -> PatchResult:
+        """Apply a V4A format patch.
+
+        ``strict_exact``: same semantics as :meth:`patch_replace` — hunks
+        that only match via a non-exact fuzzy strategy fail validation.
+        """
         ...
 
     @abstractmethod
@@ -1553,7 +1573,8 @@ class ShellFileOperations(FileOperations):
     # =========================================================================
     
     def patch_replace(self, path: str, old_string: str, new_string: str,
-                      replace_all: bool = False) -> PatchResult:
+                      replace_all: bool = False,
+                      strict_exact: bool = False) -> PatchResult:
         """
         Replace text in a file using fuzzy matching.
 
@@ -1562,6 +1583,10 @@ class ShellFileOperations(FileOperations):
             old_string: Text to find (must be unique unless replace_all=True)
             new_string: Replacement text
             replace_all: If True, replace all occurrences
+            strict_exact: If True (opt-in, CODING-HARNESS-REVIEW-2026-07-16
+                §3.3), reject matches found by any non-exact fuzzy strategy
+                instead of applying them — the error names the nearest match
+                so the model can re-read and retry with the verbatim text.
 
         Returns:
             PatchResult with diff and lint results
@@ -1604,6 +1629,63 @@ class ShellFileOperations(FileOperations):
             except Exception:
                 pass
             return PatchResult(error=err_msg)
+
+        # ── Fuzzy-strategy surfacing / strict-exact gate ──────────────
+        # CODING-HARNESS-REVIEW-2026-07-16 §3.3: the 9-strategy chain can
+        # match at a location the model did not intend (e.g. block_anchor
+        # matching a similar-but-different block), and until now the result
+        # never said WHICH strategy matched — silent wrong-location edits
+        # were invisible.  Two behaviors, both keyed off the strategy name
+        # already returned by fuzzy_find_and_replace:
+        #
+        #   * always (not config-gated): when the match was anything other
+        #     than ``exact``, name the strategy and the matched line in the
+        #     result so the model verifies placement.  Exact matches stay
+        #     silent — no noise on the common case.
+        #   * strict_exact=True (opt-in via ``file_edit_strict_exact``):
+        #     REJECT the non-exact match before anything is written, naming
+        #     the nearest match so the model re-reads and retries with the
+        #     verbatim on-disk text.
+        #
+        # fuzzy_find_matches walks the identical chain (single definition,
+        # see fuzzy_match._strategy_chain), so the reported position is the
+        # same span the replacement above used.
+        match_note = None
+        if _strategy is not None and _strategy != "exact":
+            from tools.fuzzy_match import fuzzy_find_matches, line_of_offset
+
+            _, _spans = fuzzy_find_matches(content, old_string)
+            _line = line_of_offset(content, _spans[0][0]) if _spans else None
+            _where = f"at line {_line}" if _line is not None else "at an unresolved offset"
+            if strict_exact:
+                # Show the matched file region (first lines, numbered) so
+                # the rejection is actionable without another search.
+                _snippet = ""
+                if _spans:
+                    _start, _end = _spans[0]
+                    _region_lines = content[_start:_end].split("\n")[:5]
+                    _snippet = "\n" + "\n".join(
+                        f"{(_line or 1) + _i:5d}| {_l}"
+                        for _i, _l in enumerate(_region_lines)
+                    )
+                return PatchResult(error=(
+                    f"strict-exact mode: old_string does not appear verbatim in "
+                    f"{path}. The nearest match was found by the "
+                    f"'{_strategy}' fuzzy strategy {_where}:{_snippet}\n"
+                    "No edit was applied. Re-read the file and retry with "
+                    "old_string copied exactly from the current on-disk "
+                    "content (whitespace, indentation, and punctuation "
+                    "included). (file_edit_strict_exact is enabled.)"
+                ))
+            _count_note = (
+                f" ({match_count} occurrences, first {_where})"
+                if match_count > 1 else f" {_where}"
+            )
+            match_note = (
+                f"applied via {_strategy} match{_count_note} — old_string was "
+                "not an exact match, so verify the edit landed at the "
+                "intended location (check the diff or re-read the region)."
+            )
 
         # ── Line-ending preservation ──────────────────────────────────
         # Models nearly always send old_string/new_string with bare LF
@@ -1674,12 +1756,14 @@ class ShellFileOperations(FileOperations):
             # the patch as a whole.  Keep the field separate from the
             # syntax-check ``lint`` so the agent can read both signals.
             lsp_diagnostics=write_result.lsp_diagnostics,
+            # Non-None only for non-exact fuzzy matches — see §3.3 block above.
+            match_note=match_note,
         )
     
-    def patch_v4a(self, patch_content: str) -> PatchResult:
+    def patch_v4a(self, patch_content: str, strict_exact: bool = False) -> PatchResult:
         """
         Apply a V4A format patch.
-        
+
         V4A format:
             *** Begin Patch
             *** Update File: path/to/file.py
@@ -1688,22 +1772,25 @@ class ShellFileOperations(FileOperations):
             -removed line
             +added line
             *** End Patch
-        
+
         Args:
             patch_content: V4A format patch string
-        
+            strict_exact: If True (opt-in, CODING-HARNESS-REVIEW-2026-07-16
+                §3.3), hunks that only match via a non-exact fuzzy strategy
+                fail validation and nothing is written.
+
         Returns:
             PatchResult with changes made
         """
         # Import patch parser
         from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
-        
+
         operations, parse_error = parse_v4a_patch(patch_content)
         if parse_error:
             return PatchResult(error=f"Failed to parse patch: {parse_error}")
-        
+
         # Apply operations
-        result = apply_v4a_operations(operations, self)
+        result = apply_v4a_operations(operations, self, strict_exact=strict_exact)
         return result
     
     def _check_lint(self, path: str, content: Optional[str] = None) -> LintResult:

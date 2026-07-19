@@ -79,6 +79,35 @@ def finalize_turn(
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         iteration_limit_fallback = True
         preserved_verification_fallback = True
+        # CODING-HARNESS-REVIEW-2026-07-16 §3.1: in strict verify-on-stop the
+        # iteration budget can expire mid-gate, releasing the withheld answer
+        # here instead of at the strict attempt cap in the loop. That release
+        # must carry the same loud unverified-warning banner as the cap
+        # release — the gate's whole promise is that no unverified answer
+        # ships silently. The builder re-checks the evidence ledger and
+        # returns None when verification actually passed (or there was nothing
+        # verifiable), and strict mode is opt-in, so default behavior is
+        # untouched.
+        try:
+            from agent.verification_stop import (
+                build_verify_on_stop_release_warning,
+                verify_on_stop_strict,
+            )
+
+            if verify_on_stop_strict():
+                _strict_banner = build_verify_on_stop_release_warning(
+                    session_id=getattr(agent, "session_id", None),
+                    changed_paths=getattr(agent, "_turn_file_mutation_paths", set())
+                    or set(),
+                )
+                if _strict_banner and final_response:
+                    final_response = (
+                        str(final_response).rstrip() + "\n\n" + _strict_banner
+                    )
+        except Exception:
+            logger.debug(
+                "strict verify budget-release banner failed", exc_info=True
+            )
     elif final_response is None and budget_fallback_eligible:
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a

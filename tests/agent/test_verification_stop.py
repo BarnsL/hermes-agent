@@ -9,8 +9,11 @@ from agent.verification_evidence import (
     record_terminal_result,
 )
 from agent.verification_stop import (
+    STRICT_VERIFY_MAX_ATTEMPTS,
     build_verify_on_stop_nudge,
+    build_verify_on_stop_release_warning,
     verify_on_stop_enabled,
+    verify_on_stop_strict,
 )
 
 
@@ -385,3 +388,188 @@ def test_is_non_code_path_classification():
     assert _is_non_code_path("src/app.ts") is False
     assert _is_non_code_path("config.yaml") is False
     assert _is_non_code_path("run_agent.py") is False
+
+
+# ---------------------------------------------------------------------------
+# CODING-HARNESS-REVIEW-2026-07-16 §3.1: opt-in strict verify-on-stop.
+# Config gate: only the literal "strict" value (config or env) selects the
+# hard gate; every default resolves non-strict, preserving current behavior.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "cfg_val",
+    [None, "auto", True, False, "on", "off", "bogus"],
+)
+def test_strict_mode_off_for_every_non_strict_value(clear_verify_env, cfg_val):
+    cfg = {"agent": {}} if cfg_val is None else {"agent": {"verify_on_stop": cfg_val}}
+    assert verify_on_stop_strict(cfg) is False
+
+
+def test_strict_mode_opt_in_via_config(clear_verify_env):
+    cfg = {"agent": {"verify_on_stop": "strict"}}
+    assert verify_on_stop_strict(cfg) is True
+    # Strict implies enabled, and (like explicit true) forces ON everywhere —
+    # including a messaging surface, because the operator explicitly opted in.
+    assert verify_on_stop_enabled(cfg) is True
+    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    assert verify_on_stop_enabled(cfg) is True
+
+
+def test_strict_mode_config_value_is_case_insensitive(clear_verify_env):
+    cfg = {"agent": {"verify_on_stop": "  Strict  "}}
+    assert verify_on_stop_strict(cfg) is True
+    assert verify_on_stop_enabled(cfg) is True
+
+
+def test_strict_mode_opt_in_via_env(clear_verify_env):
+    clear_verify_env.setenv("HERMES_VERIFY_ON_STOP", "strict")
+    assert verify_on_stop_strict({"agent": {}}) is True
+    assert verify_on_stop_enabled({"agent": {}}) is True
+
+
+def test_env_overrides_config_strict(clear_verify_env):
+    # Env precedence mirrors verify_on_stop_enabled: a plain on/off env value
+    # softens a machine-wide strict config for this session.
+    cfg = {"agent": {"verify_on_stop": "strict"}}
+    clear_verify_env.setenv("HERMES_VERIFY_ON_STOP", "1")
+    assert verify_on_stop_enabled(cfg) is True
+    assert verify_on_stop_strict(cfg) is False
+    clear_verify_env.setenv("HERMES_VERIFY_ON_STOP", "0")
+    assert verify_on_stop_enabled(cfg) is False
+    assert verify_on_stop_strict(cfg) is False
+
+
+# ---------------------------------------------------------------------------
+# CODING-HARNESS-REVIEW-2026-07-16 §3.1: strict gate loop behavior.
+# ---------------------------------------------------------------------------
+
+def test_default_mode_still_releases_at_two_attempts(tmp_path, monkeypatch):
+    # Default (non-strict) behavior is unchanged: the soft gate releases after
+    # 2 nudges even with no evidence, and its wording carries no strict header.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    changed = str(tmp_path / "src" / "app.ts")
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[changed])
+
+    first = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
+    assert first is not None
+    assert "STRICT" not in first
+    assert "NOT accepted" not in first
+    assert build_verify_on_stop_nudge(
+        session_id="s1",
+        changed_paths=[changed],
+        attempts=2,
+        max_attempts=2,
+    ) is None
+
+
+def test_strict_blocks_without_evidence_past_soft_cap(tmp_path, monkeypatch):
+    # Where the default gate would have released (attempts == 2), strict keeps
+    # injecting the continuation requirement up to STRICT_VERIFY_MAX_ATTEMPTS.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    changed = str(tmp_path / "src" / "app.ts")
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[changed])
+
+    for attempts in (0, 2, STRICT_VERIFY_MAX_ATTEMPTS - 1):
+        nudge = build_verify_on_stop_nudge(
+            session_id="s1",
+            changed_paths=[changed],
+            attempts=attempts,
+            max_attempts=STRICT_VERIFY_MAX_ATTEMPTS,
+            strict=True,
+        )
+        assert nudge is not None
+        assert "STRICT verify-on-stop" in nudge
+        assert "NOT accepted" in nudge
+        assert "asserting a blocker does not release the gate" in nudge
+        # The attempt counter shows the loop is bounded.
+        assert (
+            f"attempt {attempts + 1} of {STRICT_VERIFY_MAX_ATTEMPTS}" in nudge
+        )
+
+
+def test_strict_releases_with_fresh_passing_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    changed = str(tmp_path / "src" / "app.ts")
+
+    record_terminal_result(
+        command="pnpm test",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="green",
+    )
+
+    assert build_verify_on_stop_nudge(
+        session_id="s1",
+        changed_paths=[changed],
+        strict=True,
+        max_attempts=STRICT_VERIFY_MAX_ATTEMPTS,
+    ) is None
+    # A clean release also produces no warning banner.
+    assert build_verify_on_stop_release_warning(
+        session_id="s1", changed_paths=[changed]
+    ) is None
+
+
+def test_strict_releases_with_warning_banner_at_cap(tmp_path, monkeypatch):
+    # Escape hatch: at the attempt cap the gate stops nudging (the caller
+    # releases the turn) and the release-warning builder produces the loud
+    # banner because evidence is still missing.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    changed = str(tmp_path / "src" / "app.ts")
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[changed])
+
+    assert build_verify_on_stop_nudge(
+        session_id="s1",
+        changed_paths=[changed],
+        attempts=STRICT_VERIFY_MAX_ATTEMPTS,
+        max_attempts=STRICT_VERIFY_MAX_ATTEMPTS,
+        strict=True,
+    ) is None
+
+    banner = build_verify_on_stop_release_warning(
+        session_id="s1", changed_paths=[changed]
+    )
+    assert banner is not None
+    assert "RELEASED WITHOUT VERIFICATION" in banner
+    assert "UNVERIFIED" in banner
+    assert str(STRICT_VERIFY_MAX_ATTEMPTS) in banner
+
+
+def test_strict_release_warning_none_for_doc_only_edits(tmp_path, monkeypatch):
+    # Doc-only edits carry nothing verifiable — no gate, and no banner either.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    doc = str(tmp_path / "README.md")
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[doc])
+
+    assert build_verify_on_stop_release_warning(
+        session_id="s1", changed_paths=[doc]
+    ) is None
+
+
+def test_strict_release_warning_reports_failed_status(tmp_path, monkeypatch):
+    # The banner carries the ledger's last known state so the user sees WHY
+    # the release is unverified (here: the suite actually failed).
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    changed = str(tmp_path / "src" / "app.ts")
+
+    record_terminal_result(
+        command="pnpm test",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=1,
+        output="expected 1 got 2",
+    )
+
+    banner = build_verify_on_stop_release_warning(
+        session_id="s1", changed_paths=[changed]
+    )
+    assert banner is not None
+    assert "failed" in banner
+    assert "expected 1 got 2" in banner

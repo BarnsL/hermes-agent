@@ -47,6 +47,58 @@ def _unicode_normalize(text: str) -> str:
     return text
 
 
+def _strategy_chain() -> List[Tuple[str, Callable]]:
+    """Return the ordered 9-strategy matching chain.
+
+    Extracted from ``fuzzy_find_and_replace`` (CODING-HARNESS-REVIEW-2026-07-16
+    §3.3) so ``fuzzy_find_matches`` — the position-reporting helper that names
+    WHICH strategy matched and where — walks the exact same list in the exact
+    same order.  Keeping a single definition means the two functions can never
+    disagree about which strategy wins for a given (content, pattern) pair.
+    Built lazily (function, not module constant) because the strategy
+    functions are defined further down in this module.
+    """
+    return [
+        ("exact", _strategy_exact),
+        ("line_trimmed", _strategy_line_trimmed),
+        ("whitespace_normalized", _strategy_whitespace_normalized),
+        ("indentation_flexible", _strategy_indentation_flexible),
+        ("escape_normalized", _strategy_escape_normalized),
+        ("trimmed_boundary", _strategy_trimmed_boundary),
+        ("unicode_normalized", _strategy_unicode_normalized),
+        ("block_anchor", _strategy_block_anchor),
+        ("context_aware", _strategy_context_aware),
+    ]
+
+
+def fuzzy_find_matches(content: str, old_string: str) -> Tuple[Optional[str], List[Tuple[int, int]]]:
+    """Return ``(strategy_name, [(start, end), ...])`` for the first strategy that matches.
+
+    CODING-HARNESS-REVIEW-2026-07-16 §3.3: ``fuzzy_find_and_replace`` reports
+    which strategy matched but not WHERE, so a silent wrong-location fuzzy
+    edit was invisible in the tool result.  This helper re-runs the same
+    deterministic chain purely for position reporting — callers use it to
+    name the matched strategy and its line number in results, and (in
+    strict-exact mode) to describe the nearest non-exact match when
+    rejecting.  It applies no guards or replacements, so it is safe to call
+    on content that ``fuzzy_find_and_replace`` already accepted or rejected.
+
+    Returns ``(None, [])`` when no strategy matches (or old_string is empty).
+    """
+    if not old_string:
+        return None, []
+    for strategy_name, strategy_fn in _strategy_chain():
+        matches = strategy_fn(content, old_string)
+        if matches:
+            return strategy_name, matches
+    return None, []
+
+
+def line_of_offset(content: str, offset: int) -> int:
+    """Return the 1-indexed line number of character ``offset`` in ``content``."""
+    return content.count("\n", 0, max(0, offset)) + 1
+
+
 def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
                             replace_all: bool = False) -> Tuple[str, int, Optional[str], Optional[str]]:
     """
@@ -69,18 +121,8 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
     if old_string == new_string:
         return content, 0, None, "old_string and new_string are identical"
 
-    # Try each matching strategy in order
-    strategies: List[Tuple[str, Callable]] = [
-        ("exact", _strategy_exact),
-        ("line_trimmed", _strategy_line_trimmed),
-        ("whitespace_normalized", _strategy_whitespace_normalized),
-        ("indentation_flexible", _strategy_indentation_flexible),
-        ("escape_normalized", _strategy_escape_normalized),
-        ("trimmed_boundary", _strategy_trimmed_boundary),
-        ("unicode_normalized", _strategy_unicode_normalized),
-        ("block_anchor", _strategy_block_anchor),
-        ("context_aware", _strategy_context_aware),
-    ]
+    # Try each matching strategy in order (shared chain — see _strategy_chain).
+    strategies: List[Tuple[str, Callable]] = _strategy_chain()
 
     for strategy_name, strategy_fn in strategies:
         matches = strategy_fn(content, old_string)

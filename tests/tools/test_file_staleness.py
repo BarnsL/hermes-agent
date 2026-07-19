@@ -22,6 +22,8 @@ from tools.file_tools import (
     write_file_tool,
     patch_tool,
     _check_file_staleness,
+    _file_edit_require_read_enabled,
+    _read_before_edit_error,
     _read_tracker,
 )
 
@@ -290,6 +292,289 @@ class TestCheckFileStalenessHelper(unittest.TestCase):
             }
         # File doesn't exist → stat fails → returns None (let write handle it)
         self.assertIsNone(_check_file_staleness("/nonexistent/path", "t1"))
+
+
+# ---------------------------------------------------------------------------
+# Opt-in hard read-before-edit gate (CODING-HARNESS-REVIEW-2026-07-16 §3.2)
+# ---------------------------------------------------------------------------
+
+_GATE_ENV = "HERMES_FILE_EDIT_REQUIRE_READ"
+_STRICT_ENV = "HERMES_FILE_EDIT_STRICT_EXACT"
+
+
+class _EditPrecisionEnvMixin:
+    """Shared env hygiene: neither flag env var may leak between tests."""
+
+    def _clean_env(self):
+        """Enter a patch.dict(os.environ) scope with both flags removed.
+
+        patch.dict snapshots the whole environ and restores it on exit, so
+        deletions and additions made inside the scope are both undone.
+        """
+        ctx = patch.dict(os.environ)
+        ctx.start()
+        self.addCleanup(ctx.stop)
+        os.environ.pop(_GATE_ENV, None)
+        os.environ.pop(_STRICT_ENV, None)
+
+    def _bind_current_modules(self):
+        """Bind self.ft / self.fs to the modules CURRENTLY in sys.modules.
+
+        tests/agent/test_verification_stop_caching.py purges every
+        agent.*/tools.*/hermes_* entry from sys.modules and re-imports
+        run_agent. When this file runs after it in the same pytest process,
+        the symbols imported at collection time up top point at ORPHANED
+        module objects, while ``patch("tools.file_tools._get_file_ops")``
+        (resolved at test RUN time) patches the fresh replacement module —
+        so the mock never binds and the test fails order-dependently
+        (observed in the CODING-HARNESS-REVIEW-2026-07-16 verification
+        sweep; the pre-existing classes above carry the same latent hazard).
+        Calling through the current module keeps the patched module and the
+        exercised functions identical regardless of suite ordering.
+        """
+        import importlib
+        self.ft = importlib.import_module("tools.file_tools")
+        self.fs = importlib.import_module("tools.file_state")
+
+
+class TestReadBeforeEditGate(unittest.TestCase, _EditPrecisionEnvMixin):
+
+    def setUp(self):
+        self._bind_current_modules()
+        self.ft._read_tracker.clear()
+        self.fs.get_registry().clear()
+        self._clean_env()
+        self._tmpdir = tempfile.mkdtemp()
+        self._tmpfile = os.path.join(self._tmpdir, "gate_test.txt")
+        with open(self._tmpfile, "w") as f:
+            f.write("existing content\n")
+
+    def tearDown(self):
+        self.ft._read_tracker.clear()
+        self.fs.get_registry().clear()
+        for name in os.listdir(self._tmpdir):
+            try:
+                os.unlink(os.path.join(self._tmpdir, name))
+            except OSError:
+                pass
+        try:
+            os.rmdir(self._tmpdir)
+        except OSError:
+            pass
+
+    # -- default: gate OFF, behavior identical to before ------------------
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_default_off_unread_write_succeeds(self, mock_ops):
+        """Default config: writing an unread existing file is NOT blocked."""
+        mock_ops.return_value = _make_fake_ops("existing content\n", 17)
+        result = json.loads(self.ft.write_file_tool(self._tmpfile, "new", task_id="g0"))
+        self.assertNotIn("error", result)
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_default_off_unread_patch_succeeds(self, mock_ops):
+        """Default config: patching an unread existing file is NOT blocked."""
+        mock_ops.return_value = _make_fake_ops("existing content\n", 17)
+        result = json.loads(self.ft.patch_tool(
+            mode="replace", path=self._tmpfile,
+            old_string="existing", new_string="patched", task_id="g0b",
+        ))
+        self.assertNotIn("error", result)
+
+    # -- gate ON ----------------------------------------------------------
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_gate_blocks_write_on_unread_existing_file(self, mock_ops):
+        fake = _make_fake_ops("existing content\n", 17)
+        fake.write_file = MagicMock(return_value=_FakeWriteResult())
+        mock_ops.return_value = fake
+        os.environ[_GATE_ENV] = "1"
+        result = json.loads(self.ft.write_file_tool(self._tmpfile, "new", task_id="g1"))
+        self.assertIn("error", result)
+        self.assertIn("Read-before-edit gate", result["error"])
+        fake.write_file.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_gate_blocks_patch_on_unread_existing_file(self, mock_ops):
+        fake = _make_fake_ops("existing content\n", 17)
+        fake.patch_replace = MagicMock(return_value=_FakePatchResult())
+        mock_ops.return_value = fake
+        os.environ[_GATE_ENV] = "1"
+        result = json.loads(self.ft.patch_tool(
+            mode="replace", path=self._tmpfile,
+            old_string="existing", new_string="patched", task_id="g2",
+        ))
+        self.assertIn("error", result)
+        self.assertIn("Read-before-edit gate", result["error"])
+        fake.patch_replace.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_gate_allows_write_after_read(self, mock_ops):
+        mock_ops.return_value = _make_fake_ops("existing content\n", 17)
+        os.environ[_GATE_ENV] = "1"
+        self.ft.read_file_tool(self._tmpfile, task_id="g3")
+        result = json.loads(self.ft.write_file_tool(self._tmpfile, "new", task_id="g3"))
+        self.assertNotIn("error", result)
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_gate_allows_patch_after_read(self, mock_ops):
+        mock_ops.return_value = _make_fake_ops("existing content\n", 17)
+        os.environ[_GATE_ENV] = "1"
+        self.ft.read_file_tool(self._tmpfile, task_id="g4")
+        result = json.loads(self.ft.patch_tool(
+            mode="replace", path=self._tmpfile,
+            old_string="existing", new_string="patched", task_id="g4",
+        ))
+        self.assertNotIn("error", result)
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_gate_exempts_new_file_creation(self, mock_ops):
+        """Creating a file that doesn't exist yet needs no prior read."""
+        mock_ops.return_value = _make_fake_ops()
+        os.environ[_GATE_ENV] = "1"
+        new_path = os.path.join(self._tmpdir, "brand_new_gated.txt")
+        result = json.loads(self.ft.write_file_tool(new_path, "content", task_id="g5"))
+        self.assertNotIn("error", result)
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_gate_treats_own_write_as_implicit_read(self, mock_ops):
+        """Create a NEW file, then patch it without reading — allowed,
+        because a successful write records an implicit read (the agent
+        knows the content it just wrote)."""
+        fake = _make_fake_ops()
+
+        def _real_write(p, content):
+            # Fake ops that actually lands bytes on disk, so the post-write
+            # timestamp/registry bookkeeping (which stats the file) records
+            # the implicit read like the real backend would.
+            with open(p, "w") as f:
+                f.write(content)
+            return _FakeWriteResult()
+
+        fake.write_file = _real_write
+        fake.patch_replace = MagicMock(return_value=_FakePatchResult())
+        mock_ops.return_value = fake
+        os.environ[_GATE_ENV] = "1"
+        new_path = os.path.join(self._tmpdir, "created_then_patched.txt")
+        create = json.loads(self.ft.write_file_tool(new_path, "seed content\n", task_id="g6"))
+        self.assertNotIn("error", create)
+        result = json.loads(self.ft.patch_tool(
+            mode="replace", path=new_path,
+            old_string="seed", new_string="grown", task_id="g6",
+        ))
+        self.assertNotIn("error", result)
+        fake.patch_replace.assert_called_once()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_gate_blocks_v4a_update_of_unread_file(self, mock_ops):
+        fake = _make_fake_ops("existing content\n", 17)
+        fake.patch_v4a = MagicMock(return_value=_FakePatchResult())
+        mock_ops.return_value = fake
+        os.environ[_GATE_ENV] = "1"
+        v4a = (
+            "*** Begin Patch\n"
+            f"*** Update File: {self._tmpfile}\n"
+            "-existing content\n"
+            "+updated content\n"
+            "*** End Patch"
+        )
+        result = json.loads(self.ft.patch_tool(mode="patch", patch=v4a, task_id="g7"))
+        self.assertIn("error", result)
+        self.assertIn("Read-before-edit gate", result["error"])
+        fake.patch_v4a.assert_not_called()
+
+    # -- flag resolution (env vs config) ----------------------------------
+
+    def test_flag_env_wins_over_config_in_both_directions(self):
+        with patch("hermes_cli.config.load_config_readonly",
+                   return_value={"file_edit_require_read": True}):
+            os.environ[_GATE_ENV] = "0"
+            self.assertFalse(self.ft._file_edit_require_read_enabled())
+            os.environ.pop(_GATE_ENV, None)
+            self.assertTrue(self.ft._file_edit_require_read_enabled())
+        with patch("hermes_cli.config.load_config_readonly",
+                   return_value={"file_edit_require_read": False}):
+            os.environ[_GATE_ENV] = "1"
+            self.assertTrue(self.ft._file_edit_require_read_enabled())
+            os.environ.pop(_GATE_ENV, None)
+            self.assertFalse(self.ft._file_edit_require_read_enabled())
+
+    def test_helper_returns_none_when_disabled_even_if_unread(self):
+        """The gate helper itself is inert while the flag is off."""
+        self.assertIsNone(
+            self.ft._read_before_edit_error(self._tmpfile, self._tmpfile, "never-read-task")
+        )
+
+
+# ---------------------------------------------------------------------------
+# Strict-exact wiring through patch_tool (CODING-HARNESS-REVIEW-2026-07-16 §3.3)
+# ---------------------------------------------------------------------------
+
+class TestStrictExactWiring(unittest.TestCase, _EditPrecisionEnvMixin):
+
+    def setUp(self):
+        self._bind_current_modules()
+        self.ft._read_tracker.clear()
+        self.fs.get_registry().clear()
+        self._clean_env()
+        self._tmpdir = tempfile.mkdtemp()
+        self._tmpfile = os.path.join(self._tmpdir, "strict_test.txt")
+        with open(self._tmpfile, "w") as f:
+            f.write("alpha beta\n")
+
+    def tearDown(self):
+        self.ft._read_tracker.clear()
+        self.fs.get_registry().clear()
+        try:
+            os.unlink(self._tmpfile)
+            os.rmdir(self._tmpdir)
+        except OSError:
+            pass
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_default_call_omits_strict_kwarg(self, mock_ops):
+        """Flag off: patch_replace is called with the historical positional
+        signature and NO strict_exact kwarg — so existing fakes/backends
+        without the parameter keep working unchanged."""
+        fake = _make_fake_ops("alpha beta\n", 11)
+        fake.patch_replace = MagicMock(return_value=_FakePatchResult())
+        mock_ops.return_value = fake
+        json.loads(self.ft.patch_tool(
+            mode="replace", path=self._tmpfile,
+            old_string="alpha", new_string="gamma", task_id="s1",
+        ))
+        args, kwargs = fake.patch_replace.call_args
+        self.assertNotIn("strict_exact", kwargs)
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_env_flag_passes_strict_kwarg(self, mock_ops):
+        fake = _make_fake_ops("alpha beta\n", 11)
+        fake.patch_replace = MagicMock(return_value=_FakePatchResult())
+        mock_ops.return_value = fake
+        os.environ[_STRICT_ENV] = "1"
+        json.loads(self.ft.patch_tool(
+            mode="replace", path=self._tmpfile,
+            old_string="alpha", new_string="gamma", task_id="s2",
+        ))
+        args, kwargs = fake.patch_replace.call_args
+        self.assertTrue(kwargs.get("strict_exact"))
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_env_flag_passes_strict_kwarg_to_v4a(self, mock_ops):
+        fake = _make_fake_ops("alpha beta\n", 11)
+        fake.patch_v4a = MagicMock(return_value=_FakePatchResult())
+        mock_ops.return_value = fake
+        os.environ[_STRICT_ENV] = "1"
+        v4a = (
+            "*** Begin Patch\n"
+            f"*** Update File: {self._tmpfile}\n"
+            "-alpha beta\n"
+            "+gamma beta\n"
+            "*** End Patch"
+        )
+        json.loads(self.ft.patch_tool(mode="patch", patch=v4a, task_id="s3"))
+        args, kwargs = fake.patch_v4a.call_args
+        self.assertTrue(kwargs.get("strict_exact"))
 
 
 if __name__ == "__main__":

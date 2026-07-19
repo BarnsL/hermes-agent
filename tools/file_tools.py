@@ -1664,6 +1664,118 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Opt-in editing-precision gates (CODING-HARNESS-REVIEW-2026-07-16 §3.2/§3.3)
+#
+# §3.2 — hard read-before-edit gate: historically an edit on a path never
+# read this session only produced a soft ``_warning`` (file_state.check_stale
+# case 3b / _check_file_staleness), which models routinely ignore, and the
+# blind edit landed anyway.  Claude Code hard-errors in the same situation.
+# ``file_edit_require_read: true`` upgrades the warning to a tool ERROR;
+# creating a NEW file stays allowed (nothing to have read).
+#
+# §3.3 — strict-exact matching: ``file_edit_strict_exact: true`` makes the
+# patch applier reject any old_string/hunk that only matches via a non-exact
+# fuzzy strategy (see tools/fuzzy_match.py) instead of applying it.
+#
+# Both flags live at the TOP LEVEL of config.yaml — the same surface as
+# ``file_read_max_chars`` (file-tool knobs are top-level here, not under
+# ``agent.*``).  Both default OFF so default behavior is byte-identical.
+# ---------------------------------------------------------------------------
+_FLAG_TRUTHY_TOKENS = frozenset({"1", "true", "yes", "on"})
+_FLAG_FALSY_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def _edit_precision_flag(env_var: str, config_key: str) -> bool:
+    """Resolve an opt-in edit-precision flag from env + config.
+
+    Precedence mirrors ``agent/verification_stop.verify_on_stop_enabled``: an
+    explicit env var wins in BOTH directions (so an operator can soften a
+    machine-wide config per-session with ``...=0``), then the top-level
+    config.yaml key.  An unrecognized env token falls through to config
+    rather than flipping anything.  Missing/unrecognized config values are
+    OFF — these gates are strictly opt-in.
+
+    Unlike ``_get_max_read_chars`` there is NO process-lifetime cache:
+    write/patch are not hot paths, and ``load_config_readonly()`` is
+    mtime-cached (~µs on a hit), so re-resolving per call lets tests and
+    long-lived gateway processes pick up config changes without a restart.
+    """
+    env = os.environ.get(env_var)
+    if env is not None:
+        token = env.strip().lower()
+        if token in _FLAG_TRUTHY_TOKENS:
+            return True
+        if token in _FLAG_FALSY_TOKENS:
+            return False
+    try:
+        from hermes_cli.config import load_config_readonly
+        val = load_config_readonly().get(config_key)
+    except Exception:
+        return False
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in _FLAG_TRUTHY_TOKENS
+    return False
+
+
+def _file_edit_require_read_enabled() -> bool:
+    """§3.2 hard read-before-edit gate — default False (warn-only, as today)."""
+    return _edit_precision_flag("HERMES_FILE_EDIT_REQUIRE_READ", "file_edit_require_read")
+
+
+def _file_edit_strict_exact_enabled() -> bool:
+    """§3.3 strict-exact patch matching — default False (fuzzy apply, as today)."""
+    return _edit_precision_flag("HERMES_FILE_EDIT_STRICT_EXACT", "file_edit_strict_exact")
+
+
+def _read_before_edit_error(display_path: str, resolved: str | None,
+                            task_id: str) -> str | None:
+    """Return a hard-gate error when an EXISTING file is edited without a prior read.
+
+    CODING-HARNESS-REVIEW-2026-07-16 §3.2.  Returns ``None`` (no block) when:
+
+      * the gate is disabled (the default — soft warning behavior unchanged);
+      * ``resolved`` is None (unresolvable path — keep legacy behavior rather
+        than blocking on a resolution failure; the container/remote backends
+        also land here when the target isn't stat-able on the host, matching
+        the host-stat semantics of ``_check_file_staleness``);
+      * the file does not exist yet (creating a NEW file needs no prior read);
+      * this task HAS read (or previously written — a write is an implicit
+        read, same rule as ``file_state.note_write``) the resolved path, per
+        either the per-task ``_read_tracker`` timestamps or the cross-agent
+        ``file_state`` registry.  Two sources because either can be
+        individually unavailable (registry disabled via
+        ``HERMES_DISABLE_FILE_STATE_GUARD``; tracker entries evicted by
+        ``_READ_TIMESTAMPS_CAP``).
+    """
+    if not _file_edit_require_read_enabled():
+        return None
+    if resolved is None:
+        return None
+    try:
+        if not os.path.exists(resolved):
+            return None  # New-file creation is exempt.
+    except OSError:
+        return None
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id)
+        if task_data and resolved in task_data.get("read_timestamps", {}):
+            return None
+    try:
+        if resolved in file_state.known_reads(task_id):
+            return None
+    except Exception:
+        pass
+    return (
+        f"Read-before-edit gate: {display_path} exists but has not been read "
+        "in this session. Use read_file on it first so the edit is based on "
+        "the file's current content, then retry. Creating a new file is "
+        "exempt. (file_edit_require_read is enabled.)"
+    )
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -1713,6 +1825,14 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
         with file_state.lock_path(_resolved):
+            # CODING-HARNESS-REVIEW-2026-07-16 §3.2 — opt-in hard
+            # read-before-edit gate.  Checked inside the per-path lock so a
+            # sibling can't create/read the file between check and write.
+            # Default OFF: the helper returns None and the legacy soft
+            # warnings below are the only signal, exactly as before.
+            _gate_err = _read_before_edit_error(path, _resolved, task_id)
+            if _gate_err:
+                return tool_error(_gate_err)
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
@@ -1759,6 +1879,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     """
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
+    # V4A ``*** Update File:`` targets only — the §3.2 read-before-edit gate
+    # applies to content EDITS of existing files.  Add creates (exempt by
+    # definition), Delete/Move don't rewrite content from a possibly-stale
+    # view, so only Update headers join replace-mode ``path`` in the gate.
+    _v4a_update_paths: list[str] = []
     if path:
         _paths_to_check.append(path)
     if mode == "patch" and patch:
@@ -1786,12 +1911,17 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # it accepts ``***Update File:`` with no space after the asterisks
         # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
         # here let a no-space header parse + apply while skipping this check.
-        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
+        # The op keyword is CAPTURED (was ``(?:...)``) solely so Update
+        # targets can also feed the §3.2 read-before-edit gate below —
+        # traversal rejection and sensitive-path checks are unchanged.
+        for _m in _re.finditer(r'^\*\*\*\s*(Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
+            v4a_path = _m.group(2).strip()
             _err = _reject_v4a_traversal(v4a_path)
             if _err:
                 return _err
             _paths_to_check.append(v4a_path)
+            if _m.group(1) == "Update":
+                _v4a_update_paths.append(v4a_path)
         # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
         # but was never extracted, so a Move targeting /etc/crontab skipped the
         # sensitive-path pre-check. Check BOTH endpoints, and run them through
@@ -1853,7 +1983,26 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _sw:
                     stale_warnings.append(_sw)
 
+            # CODING-HARNESS-REVIEW-2026-07-16 §3.2 — opt-in hard
+            # read-before-edit gate, checked while the per-path locks are
+            # held (same TOCTOU reasoning as write_file_tool).  Replace mode
+            # gates its explicit ``path``; V4A gates every ``Update File:``
+            # header.  Adds are exempt via the helper's exists() check, and
+            # Delete/Move were excluded at extraction time.  Default OFF —
+            # the helper returns None and behavior is identical to before.
+            _gate_paths = ([path] if mode == "replace" and path else _v4a_update_paths)
+            for _p in _gate_paths:
+                _gate_err = _read_before_edit_error(_p, _path_to_resolved.get(_p), task_id)
+                if _gate_err:
+                    return tool_error(_gate_err)
+
             file_ops = _get_file_ops(task_id)
+
+            # CODING-HARNESS-REVIEW-2026-07-16 §3.3 — opt-in strict-exact
+            # matching.  The kwarg is only passed when the flag is ON so the
+            # default call signature stays byte-identical for existing mocks
+            # and any out-of-tree FileOperations implementations.
+            _strict_exact = _file_edit_strict_exact_enabled()
 
             if mode == "replace":
                 if not path:
@@ -1866,11 +2015,20 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 # path would let the two layers disagree about which file is
                 # being edited.
                 _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
+                if _strict_exact:
+                    result = file_ops.patch_replace(
+                        _replace_target, old_string, new_string, replace_all,
+                        strict_exact=True,
+                    )
+                else:
+                    result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                if _strict_exact:
+                    result = file_ops.patch_v4a(patch, strict_exact=True)
+                else:
+                    result = file_ops.patch_v4a(patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
