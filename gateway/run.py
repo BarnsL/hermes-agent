@@ -3974,9 +3974,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Persist the runtime model/provider actually used by a gateway turn.
 
         Provider fallback can switch ``agent.model``/``agent.provider`` after the
-        session row was created. Keep the session DB metadata in sync so session
-        lists, desktop/dashboard details, and follow-up session tooling report the
-        backend that actually answered the latest turn.
+        session row was created. The runtime that answered is recorded in
+        ``model_config.gateway_runtime`` for diagnostics — but the session's
+        ``model`` column is only updated when the turn ran on the PRIMARY
+        (user-selected) model. A fallback model must never be persisted as the
+        session's model: that column is the user's durable selection and feeds
+        the composer footer + resume restoration (CRITICAL #25, 2026-07-18).
 
         Called from the ``run_sync`` closure, which executes off the event loop
         in the executor thread — so the synchronous ``SessionDB`` (``_db``) is
@@ -3987,13 +3990,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         model = getattr(agent, "model", None)
         if not model:
             return
+        fallback_active = bool(getattr(agent, "_fallback_activated", False))
         runtime = {
             "provider": getattr(agent, "provider", None),
             "base_url": getattr(agent, "base_url", None),
             "api_mode": getattr(agent, "api_mode", None),
-            "fallback_active": bool(getattr(agent, "_fallback_activated", False)),
+            "fallback_active": fallback_active,
         }
         runtime = {k: v for k, v in runtime.items() if v not in (None, "")}
+        # CRITICAL #25 (2026-07-18): when the turn was answered by a FALLBACK
+        # model, do NOT overwrite the session's `model` column with it. The
+        # stored model is the user's durable selection — it feeds the desktop
+        # composer footer, resume restoration, and the session list. Writing
+        # the fallback here made a transient provider blip permanent: a
+        # Discord session kept `qwen2.5:14b-instruct-q4_K_M` as its model for
+        # 5 days after a single DeepSeek 402. The runtime that actually
+        # answered is still recorded in gateway_runtime (with
+        # fallback_active=true) for diagnostics; update_session_meta uses
+        # COALESCE, so model=None leaves the stored selection untouched.
+        persist_model = None if fallback_active else model
+        if fallback_active:
+            runtime["fallback_model"] = model
 
         try:
             db = self._session_db._db
@@ -4009,12 +4026,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not isinstance(config, dict):
                 config = {}
             gateway_runtime = dict(config.get("gateway_runtime") or {})
-            if current_model == model and all(
+            model_unchanged = persist_model is None or current_model == persist_model
+            if model_unchanged and all(
                 gateway_runtime.get(k) == v for k, v in runtime.items()
             ):
                 return
             config["gateway_runtime"] = runtime
-            db.update_session_meta(session_id, json.dumps(config), model=model)
+            db.update_session_meta(session_id, json.dumps(config), model=persist_model)
         except Exception:
             logger.debug("Failed to sync gateway session model metadata", exc_info=True)
 

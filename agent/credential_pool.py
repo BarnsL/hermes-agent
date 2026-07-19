@@ -113,6 +113,15 @@ SUPPORTED_POOL_STRATEGIES = {
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+# CRITICAL #25 (2026-07-18): subscription-quota 400s recover FAST. Anthropic's
+# Claude-subscription OAuth lane rejects with HTTP 400 "You're out of extra
+# usage..." when the plan window is spent — but the 5-hour window rolls
+# continuously, so quota routinely returns within minutes (verified live:
+# 400 at 19:27:42, direct probe 200 by 19:39). The old 1-hour default froze
+# the ONLY anthropic credential for the full hour, so every turn silently
+# skipped Anthropic long after quota was back. 400 responses carry no
+# reset_at header, so the TTL is the only recovery path — keep it short.
+EXHAUSTED_TTL_400_SECONDS = 10 * 60          # 10 minutes
 
 # Pool key prefix for custom OpenAI-compatible endpoints.
 # Custom endpoints all share provider='custom' but are keyed by their
@@ -270,6 +279,11 @@ def _exhausted_ttl(error_code: Optional[int]) -> int:
         return EXHAUSTED_TTL_401_SECONDS
     if error_code == 429:
         return EXHAUSTED_TTL_429_SECONDS
+    if error_code == 400:
+        # Subscription-quota rejections (Anthropic OAuth "out of extra
+        # usage") — the rolling plan window restores quota within minutes,
+        # not hours. See EXHAUSTED_TTL_400_SECONDS above (CRITICAL #25).
+        return EXHAUSTED_TTL_400_SECONDS
     return EXHAUSTED_TTL_DEFAULT_SECONDS
 
 

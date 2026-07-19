@@ -1647,6 +1647,35 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent.reasoning_config = resolve_reasoning_config(
                 load_config() or {}, agent.model
             )
+            # CRITICAL #25 (2026-07-18): capability-gate the resolved config.
+            # A global `agent.reasoning_effort: high` used to ride along onto
+            # fallback models that cannot think — Ollama then rejected the
+            # request with HTTP 400 '"qwen2.5:14b-instruct-q4_K_M" does not
+            # support thinking', so the fallback failed too and the user got a
+            # dead turn. At fallback time availability beats thinking quality:
+            # unless the catalog POSITIVELY says the fallback model supports
+            # reasoning, drop the thinking params. (Unknown/custom models —
+            # get_model_capabilities returns None — are treated as
+            # non-reasoning here; an explicit user selection of such a model
+            # is unaffected by this path and is covered by
+            # agent.reasoning_overrides in config.yaml instead.)
+            if agent.reasoning_config and agent.reasoning_config.get("enabled"):
+                try:
+                    from agent.models_dev import get_model_capabilities
+
+                    _fb_caps = get_model_capabilities(agent.model)
+                    if _fb_caps is None or not getattr(_fb_caps, "supports_reasoning", False):
+                        logger.info(
+                            "Fallback %s: model does not (verifiably) support "
+                            "reasoning — disabling thinking for the swap "
+                            "(was %s)",
+                            agent.model, agent.reasoning_config,
+                        )
+                        agent.reasoning_config = None
+                except Exception:
+                    # Capability lookup must never break the swap; fail toward
+                    # NO thinking — the safe direction for availability.
+                    agent.reasoning_config = None
             logger.info(
                 "Fallback %s: reasoning_config resolved: %s",
                 agent.model, agent.reasoning_config,
