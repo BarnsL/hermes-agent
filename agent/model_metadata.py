@@ -2067,7 +2067,85 @@ def _resolve_nous_context_length(
     return None, ""
 
 
+# CRITICAL #26 (2026-07-19): Anthropic bills any >200K-input request on a
+# SUBSCRIPTION (OAuth) account to the EXTRA-USAGE budget, not plan limits —
+# even without the context-1m beta header (1M context is GA on Claude 4.6+).
+# A 339K-token desktop session got permanent "You're out of extra usage"
+# 400s while a small probe on the same token returned 200 (plan lane).
+# Capping the resolved context at 200K keeps compression triggering early
+# enough that requests stay in the self-refilling plan lane. Metered API
+# keys (x-api-key) are NOT capped — long context bills normally there.
+# Escape hatch: config `anthropic.long_context: true` restores the full
+# window for users who deliberately fund extra usage.
+_SUBSCRIPTION_PLAN_CONTEXT_CAP = 200_000
+
+
+def _apply_subscription_context_cap(
+    resolved: int, provider: str, api_key: str
+) -> int:
+    """Clamp OAuth-subscription Anthropic context to the plan-lane boundary."""
+    if resolved <= _SUBSCRIPTION_PLAN_CONTEXT_CAP:
+        return resolved
+    if (provider or "").strip().lower() not in {"anthropic", "claude", "claude-code"}:
+        return resolved
+    try:
+        from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
+
+        token = api_key if isinstance(api_key, str) and api_key.strip() else ""
+        if not token:
+            token = resolve_anthropic_token() or ""
+        if not _is_oauth_token(token):
+            return resolved  # metered key: no extra-usage lane concern
+    except Exception:
+        return resolved
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        anth_cfg = (load_config_readonly() or {}).get("anthropic") or {}
+        if anth_cfg.get("long_context") is True:
+            return resolved
+    except Exception:
+        pass
+    logger.info(
+        "Context capped %d -> %d for subscription (OAuth) anthropic model — "
+        ">200K input bills EXTRA USAGE, not plan limits. Set "
+        "anthropic.long_context: true to opt back into the full window "
+        "(CRITICAL #26).",
+        resolved,
+        _SUBSCRIPTION_PLAN_CONTEXT_CAP,
+    )
+    return _SUBSCRIPTION_PLAN_CONTEXT_CAP
+
+
 def get_model_context_length(
+    model: str,
+    base_url: str = "",
+    api_key: str = "",
+    config_context_length: int | None = None,
+    provider: str = "",
+    custom_providers: list | None = None,
+) -> int:
+    """Get the context length for a model (subscription plan-lane capped).
+
+    Thin wrapper over the uncapped resolution chain below: the resolved
+    value is passed through :func:`_apply_subscription_context_cap` so
+    OAuth-subscription Anthropic models never advertise a window whose use
+    would bill the extra-usage lane (CRITICAL #26). All callers — sync,
+    async (via to_thread), display/footer, compression thresholds — go
+    through this seam.
+    """
+    resolved = _get_model_context_length_uncapped(
+        model,
+        base_url=base_url,
+        api_key=api_key,
+        config_context_length=config_context_length,
+        provider=provider,
+        custom_providers=custom_providers,
+    )
+    return _apply_subscription_context_cap(resolved, provider, api_key)
+
+
+def _get_model_context_length_uncapped(
     model: str,
     base_url: str = "",
     api_key: str = "",

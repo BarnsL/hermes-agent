@@ -264,3 +264,51 @@ def test_reasoning_override_disables_thinking_for_local_qwen():
     other = resolve_reasoning_config(cfg, "claude-opus-4-8")
     assert other is not None
     assert other.get("enabled") is True
+
+
+def test_critical26_subscription_context_capped_at_plan_lane(monkeypatch):
+    """CRITICAL #26: OAuth-subscription Anthropic models must never advertise
+    a context window whose use bills the extra-usage lane (>200K input).
+    Metered API keys and other providers keep their full windows."""
+    from agent.model_metadata import _apply_subscription_context_cap
+
+    # OAuth token → capped.
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.resolve_anthropic_token",
+        lambda: "sk-ant-oat01-test-token",
+    )
+    assert _apply_subscription_context_cap(1_000_000, "anthropic", "") == 200_000
+    assert (
+        _apply_subscription_context_cap(1_000_000, "anthropic", "sk-ant-oat01-x")
+        == 200_000
+    )
+    # Already under the boundary → untouched.
+    assert _apply_subscription_context_cap(200_000, "anthropic", "sk-ant-oat01-x") == 200_000
+    assert _apply_subscription_context_cap(128_000, "anthropic", "sk-ant-oat01-x") == 128_000
+    # Metered console key → NOT capped.
+    assert (
+        _apply_subscription_context_cap(1_000_000, "anthropic", "sk-ant-api03-x")
+        == 1_000_000
+    )
+    # Other providers → never touched.
+    assert _apply_subscription_context_cap(1_000_000, "deepseek", "") == 1_000_000
+    assert _apply_subscription_context_cap(1_000_000, "custom", "ollama") == 1_000_000
+
+
+def test_critical26_long_context_escape_hatch(monkeypatch, tmp_path):
+    """anthropic.long_context: true restores the full window (deliberate
+    extra-usage opt-in)."""
+    from agent.model_metadata import _apply_subscription_context_cap
+
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.resolve_anthropic_token",
+        lambda: "sk-ant-oat01-test-token",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"anthropic": {"long_context": True}},
+    )
+    assert (
+        _apply_subscription_context_cap(1_000_000, "anthropic", "sk-ant-oat01-x")
+        == 1_000_000
+    )
