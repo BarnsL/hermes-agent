@@ -1264,6 +1264,15 @@ export interface Translations {
     noMatch: (query: string) => string
     results: string
     pinned: string
+    categories: {
+      sectionLabel: string
+      newCategory: string
+      defaultName: string
+      menu: string
+      rename: string
+      delete: string
+      dropHint: string
+    }
     sessions: string
     cronJobs: string
     groupAriaGrouped: string

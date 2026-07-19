@@ -24,9 +24,15 @@ const ROW_CLASS =
 const POPOVER_SHELL =
   'absolute right-full top-1/2 z-50 max-h-[min(22rem,calc(100vh-8rem))] w-80 max-w-[min(20rem,calc(100vw-2rem))] -translate-y-1/2 overflow-x-hidden overflow-y-auto overscroll-contain rounded-lg border p-1 text-popover-foreground transition-[opacity,transform] duration-100 ease-out group-hover/timeline:transition-none'
 
+// The timeline only ever shows a ~120-char preview (after whitespace collapse),
+// so 2 KB of raw text always derives the identical preview. Capping the harvest
+// keeps the selector below — which runs on every AUI store notification, i.e.
+// every stream flush — flat no matter how large pasted prompts get.
+const PROMPT_HARVEST_MAX = 2048
+
 function userPromptText(content: unknown): string {
   if (typeof content === 'string') {
-    return content
+    return content.slice(0, PROMPT_HARVEST_MAX)
   }
 
   if (!Array.isArray(content)) {
@@ -36,6 +42,10 @@ function userPromptText(content: unknown): string {
   let out = ''
 
   for (const part of content) {
+    if (out.length >= PROMPT_HARVEST_MAX) {
+      break
+    }
+
     if (typeof part === 'string') {
       out += part
 
@@ -53,7 +63,7 @@ function userPromptText(content: unknown): string {
     }
   }
 
-  return out
+  return out.slice(0, PROMPT_HARVEST_MAX)
 }
 
 /** Index-keyed ref-array setter — `ref={listRef(refs, i)}`. */
@@ -178,7 +188,10 @@ export const ThreadTimeline: FC = () => {
   useEffect(() => {
     const viewport = document.querySelector<HTMLElement>(VIEWPORT)
 
-    if (!viewport || entries.length === 0) {
+    // < MIN_ENTRIES (not just 0): the component renders null below the
+    // threshold, so activeIndex is unused and tiny threads shouldn't pay for
+    // the scroll listener at all.
+    if (!viewport || entries.length < MIN_ENTRIES) {
       return
     }
 
@@ -189,8 +202,21 @@ export const ThreadTimeline: FC = () => {
 
       const top = viewport.getBoundingClientRect().top
 
+      // One DOM traversal per compute instead of a per-entry querySelector
+      // scan of the whole transcript (which made each scroll frame O(entries ×
+      // DOM) while streaming kept the viewport scrolling at flush cadence).
+      const byId = new Map<string, HTMLElement>()
+
+      for (const el of viewport.querySelectorAll<HTMLElement>('[data-message-id]')) {
+        const id = el.getAttribute('data-message-id')
+
+        if (id) {
+          byId.set(id, el)
+        }
+      }
+
       const offsets = entries.map(entry => {
-        const node = viewport.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(entry.id)}"]`)
+        const node = byId.get(entry.id)
 
         return node ? node.getBoundingClientRect().top - top : null
       })

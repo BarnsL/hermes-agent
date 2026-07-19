@@ -18,6 +18,7 @@ import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
+import { consumePointerDragClick, startSessionPointerTracking } from './session-pointer-drag'
 
 interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   session: SessionInfo
@@ -153,7 +154,21 @@ export function SidebarSessionRow({
         {isWorking && !needsInput && <span aria-hidden="true" className="arc-border" />}
         <SidebarRowBody
           className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
+          // The body is a <button>; some Chromium builds refuse to initiate an
+          // ANCESTOR's drag from a form-control child. Making the button
+          // itself draggable guarantees dragstart fires here and bubbles to
+          // the shell's onDragStart above.
+          draggable
           onClick={event => {
+            // A pointer-fallback drag just ended on this press — swallow the
+            // click so the drop doesn't also resume the session.
+            if (consumePointerDragClick()) {
+              event.preventDefault()
+              event.stopPropagation()
+
+              return
+            }
+
             if (event.shiftKey) {
               event.preventDefault()
               event.stopPropagation()
@@ -178,6 +193,16 @@ export function SidebarSessionRow({
 
             onResume()
           }}
+          onPointerDown={event =>
+            // Pointer-events fallback for environments where the OS drag loop
+            // dies right after dragstart (see session-pointer-drag.ts).
+            // Dormant when native HTML5 drag works.
+            startSessionPointerTracking(event, {
+              id: session.id,
+              profile: session.profile || 'default',
+              title
+            })
+          }
         >
           {reorderable ? (
             <SidebarRowGrab

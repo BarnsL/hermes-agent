@@ -662,14 +662,18 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "tts.provider": {
         "type": "select",
         "description": "Text-to-speech provider",
-        "options": ["edge", "elevenlabs", "openai", "neutts"],
+        # "conversoar" added locally (CV-011): it's this machine's pinned
+        # command provider; without it in the list the Settings dropdown
+        # could only rewrite the provider to a builtin (silent drift).
+        "options": ["conversoar", "edge", "elevenlabs", "openai", "neutts"],
     },
     "stt.provider": {
         "type": "select",
         "description": "Speech-to-text provider",
         # "mistral" temporarily removed — mistralai PyPI package quarantined
         # (malicious 2.4.6 release on 2026-05-12). Restore once available.
-        "options": ["local", "groq", "openai", "xai", "elevenlabs"],
+        # "conversoar" added locally (CV-011) — see tts.provider note.
+        "options": ["conversoar", "local", "groq", "openai", "xai", "elevenlabs"],
     },
     "stt.elevenlabs.model_id": {
         "type": "select",
@@ -4039,7 +4043,7 @@ def get_sessions(
     if profile:
         profile_name, _ = _cron_profile_home(profile)
     try:
-        db = _open_session_db_for_profile(profile)
+        db = _open_session_db_for_profile(profile, read_only=True)
         try:
             min_message_count = max(0, min_messages)
             archived_only = archived == "only"
@@ -9853,7 +9857,7 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
     UI hides the affordance so users aren't presented with a button
     that does nothing. Cheap, single-COUNT query.
     """
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         return {"count": db.count_empty_sessions()}
     finally:
@@ -9895,7 +9899,7 @@ async def get_session_stats(profile: Optional[str] = None):
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
     """
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         total = db.session_count(include_archived=True)
         active_store = db.session_count(include_archived=False)
@@ -9919,34 +9923,55 @@ async def get_session_stats(profile: Optional[str] = None):
         db.close()
 
 
-def _open_session_db_for_profile(profile: Optional[str]):
-    """Open a SessionDB for read paths, optionally for another profile.
+def _open_session_db_for_profile(
+    profile: Optional[str],
+    *,
+    read_only: bool = False,
+):
+    """Open a SessionDB, optionally for another profile.
 
     ``profile`` None/empty → this process's own ``state.db`` (the common,
     single-profile case). A named profile opens that profile's on-disk
     ``state.db`` directly so the primary backend can serve cross-profile reads
     (transcripts, detail) without spawning that profile's backend.
+
+    Read-only callers skip schema reconciliation and FTS setup entirely. That
+    is important for desktop refresh/resume traffic: constructing a writable
+    ``SessionDB`` performs idempotent DDL, which can fail with ``database is
+    locked`` while the live gateway owns a write transaction. A fresh install
+    still gets the writable initializer so its first empty session list works.
     """
-    from hermes_state import SessionDB
-    if not profile:
-        return SessionDB()
-    _name, home = _cron_profile_home(profile)
-    return SessionDB(db_path=Path(home) / "state.db")
+    from hermes_state import DEFAULT_DB_PATH, SessionDB
+
+    if profile:
+        _name, home = _cron_profile_home(profile)
+        db_path = Path(home) / "state.db"
+    else:
+        db_path = Path(DEFAULT_DB_PATH)
+
+    use_read_only = bool(read_only and db_path.exists())
+    return SessionDB(db_path=db_path, read_only=use_read_only)
 
 
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        session = db.get_session(sid) if sid else None
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        if profile:
-            session["profile"] = _cron_profile_home(profile)[0]
-        return session
-    finally:
-        db.close()
+    # SessionDB is synchronous. Keep lineage/detail reads off uvicorn's event
+    # loop so a large transcript in another request cannot starve WebSocket
+    # frames and turn an otherwise healthy resume into a timeout.
+    def _read():
+        db = _open_session_db_for_profile(profile, read_only=True)
+        try:
+            sid = db.resolve_session_id(session_id)
+            session = db.get_session(sid) if sid else None
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if profile:
+                session["profile"] = _cron_profile_home(profile)[0]
+            return session
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_read)
 
 
 
@@ -9955,19 +9980,22 @@ async def get_session_latest_descendant(
     session_id: str,
     profile: Optional[str] = None,
 ):
-    db = _open_session_db_for_profile(profile)
-    try:
-        latest, path = _session_latest_descendant(session_id, db)
-        if not latest:
-            raise HTTPException(status_code=404, detail="Session not found")
-        return {
-            "requested_session_id": path[0] if path else session_id,
-            "session_id": latest,
-            "path": path,
-            "changed": bool(path and latest != path[0]),
-        }
-    finally:
-        db.close()
+    def _read():
+        db = _open_session_db_for_profile(profile, read_only=True)
+        try:
+            latest, path = _session_latest_descendant(session_id, db)
+            if not latest:
+                raise HTTPException(status_code=404, detail="Session not found")
+            return {
+                "requested_session_id": path[0] if path else session_id,
+                "session_id": latest,
+                "path": path,
+                "changed": bool(path and latest != path[0]),
+            }
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_read)
 
 @app.get("/api/sessions/{session_id}/messages")
 async def get_session_messages(
@@ -9976,26 +10004,34 @@ async def get_session_messages(
     limit: Optional[int] = None,
     offset: int = 0,
 ):
-    db = _open_session_db_for_profile(profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        if not sid:
-            raise HTTPException(status_code=404, detail="Session not found")
-        sid = db.resolve_resume_session_id(sid)
-        # Clamp limit to prevent abuse (max 500 per page)
-        _limit = min(limit, 500) if limit is not None else None
-        messages = db.get_messages(sid, limit=_limit, offset=offset)
-        return {
-            "session_id": sid,
-            "messages": messages,
-            "pagination": {
-                "limit": _limit,
-                "offset": offset,
-                "returned": len(messages),
-            },
-        }
-    finally:
-        db.close()
+    # A whole-history read includes synchronous SQLite work plus per-message
+    # JSON decoding. On multi-thousand-message sessions this previously parked
+    # the event loop long enough for the concurrent session.resume WebSocket
+    # response to miss its deadline. Run the complete blocking sequence in a
+    # worker, not just the final query.
+    def _read():
+        db = _open_session_db_for_profile(profile, read_only=True)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Session not found")
+            resolved_sid = db.resolve_resume_session_id(sid)
+            # Clamp limit to prevent abuse (max 500 per page)
+            read_limit = min(limit, 500) if limit is not None else None
+            messages = db.get_messages(resolved_sid, limit=read_limit, offset=offset)
+            return {
+                "session_id": resolved_sid,
+                "messages": messages,
+                "pagination": {
+                    "limit": read_limit,
+                    "offset": offset,
+                    "returned": len(messages),
+                },
+            }
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_read)
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -10068,7 +10104,7 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
 @app.get("/api/sessions/{session_id}/export")
 async def export_session_endpoint(session_id: str, profile: Optional[str] = None):
     """Export a single session (metadata + messages) as JSON."""
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         sid = db.resolve_session_id(session_id)
         if not sid:
@@ -10539,7 +10575,7 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
     except (TypeError, ValueError):
         limit_n = 20
 
-    db = _open_session_db_for_profile(selected)
+    db = _open_session_db_for_profile(selected, read_only=True)
     try:
         runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
         now = time.time()
@@ -14163,7 +14199,7 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
 async def get_usage_analytics(days: int = 30, profile: Optional[str] = None):
     from agent.insights import InsightsEngine
 
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         cutoff = time.time() - (days * 86400)
         cur = db._conn.execute("""
@@ -14237,7 +14273,7 @@ async def get_models_analytics(days: int = 30, profile: Optional[str] = None):
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         cutoff = time.time() - (days * 86400)
 
@@ -14847,7 +14883,8 @@ def _resolve_chat_argv(
 
     if resume:
         _resume_db = _open_session_db_for_profile(
-            requested if profile_dir is not None else None
+            requested if profile_dir is not None else None,
+            read_only=True,
         )
         try:
             latest_resume, _latest_path = _session_latest_descendant(resume, _resume_db)

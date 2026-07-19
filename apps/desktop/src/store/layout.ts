@@ -28,6 +28,7 @@ const SIDEBAR_PROJECT_ORDER_STORAGE_KEY = 'hermes.desktop.projectOrder'
 const SIDEBAR_WORKSPACE_COLLAPSED_STORAGE_KEY = 'hermes.desktop.workspaceCollapsed'
 const SIDEBAR_DISMISSED_AUTO_PROJECTS_STORAGE_KEY = 'hermes.desktop.dismissedAutoProjects'
 const SIDEBAR_DISMISSED_WORKTREES_STORAGE_KEY = 'hermes.desktop.dismissedWorktrees'
+const SIDEBAR_CATEGORIES_STORAGE_KEY = 'hermes.desktop.sessionCategories'
 const PANES_FLIPPED_STORAGE_KEY = 'hermes.desktop.panesFlipped'
 const RIGHT_RAIL_ACTIVE_TAB_STORAGE_KEY = 'hermes.desktop.rightRailActiveTab'
 
@@ -331,4 +332,139 @@ export function resetSessionsLimit() {
   if ($sessionsLimit.get() !== SIDEBAR_SESSIONS_PAGE_SIZE) {
     $sessionsLimit.set(SIDEBAR_SESSIONS_PAGE_SIZE)
   }
+}
+
+// ── Session categories ───────────────────────────────────────────────────────
+// User-defined buckets in the sidebar: drag a session onto a category to file
+// it there. A category is a VIEW over sessions (membership is a list of ids);
+// the flat recents list still shows every session.
+//
+// `sessionIds` hold the DURABLE session id (the lineage root when present —
+// see sessionPinId in store/session.ts), same as pins: auto-compression
+// rotates a conversation's live id, so membership keyed on the live id would
+// evaporate on the next compression. Callers resolve live → durable at drop
+// time; rendering resolves durable → live through the sidebar's session map.
+
+export interface SessionCategory {
+  id: string
+  name: string
+  sessionIds: string[]
+  collapsed?: boolean
+}
+
+// Untrusted persisted shape → drop anything malformed rather than crash.
+// Exported for tests.
+export function sanitizeCategories(value: unknown): SessionCategory[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value.flatMap((entry): SessionCategory[] => {
+    if (!entry || typeof entry !== 'object') {
+      return []
+    }
+
+    const { collapsed, id, name, sessionIds } = entry as Partial<SessionCategory>
+
+    if (typeof id !== 'string' || id.length === 0 || typeof name !== 'string') {
+      return []
+    }
+
+    return [
+      {
+        id,
+        name,
+        sessionIds: Array.isArray(sessionIds)
+          ? sessionIds.filter((sessionId): sessionId is string => typeof sessionId === 'string')
+          : [],
+        ...(collapsed === true ? { collapsed: true } : {})
+      }
+    ]
+  })
+}
+
+// A JSON array (not a Record) so the order is explicit and a future
+// drag-reorder is just an array move.
+export const $sessionCategories = persistentAtom<SessionCategory[]>(
+  SIDEBAR_CATEGORIES_STORAGE_KEY,
+  [],
+  Codecs.json(sanitizeCategories)
+)
+
+let categoryCounter = 0
+
+function newCategoryId(): string {
+  return `cat_${Date.now()}_${++categoryCounter}`
+}
+
+export function createCategory(name: string): SessionCategory {
+  const category: SessionCategory = { id: newCategoryId(), name, sessionIds: [] }
+
+  $sessionCategories.set([...$sessionCategories.get(), category])
+
+  return category
+}
+
+export function renameCategory(categoryId: string, name: string) {
+  $sessionCategories.set(
+    $sessionCategories.get().map(category => (category.id === categoryId ? { ...category, name } : category))
+  )
+}
+
+export function deleteCategory(categoryId: string) {
+  $sessionCategories.set($sessionCategories.get().filter(category => category.id !== categoryId))
+}
+
+export function toggleCategoryCollapsed(categoryId: string) {
+  $sessionCategories.set(
+    $sessionCategories
+      .get()
+      .map(category => (category.id === categoryId ? { ...category, collapsed: !category.collapsed } : category))
+  )
+}
+
+// A session lives in at most ONE category: moving removes it everywhere else
+// first, so dragging between categories behaves like a move, not a copy.
+// No-op when the target category no longer exists (e.g. deleted in another
+// window between drag start and drop) — stripping the session from every
+// category and filing it nowhere would silently lose the membership.
+export function moveSessionToCategory(sessionId: string, categoryId: string) {
+  const categories = $sessionCategories.get()
+
+  if (!categories.some(category => category.id === categoryId)) {
+    return
+  }
+
+  $sessionCategories.set(
+    categories.map(category => {
+      const without = category.sessionIds.filter(id => id !== sessionId)
+
+      return category.id === categoryId
+        ? { ...category, sessionIds: [...without, sessionId] }
+        : { ...category, sessionIds: without }
+    })
+  )
+}
+
+// Rename-in-progress marker, deliberately NOT persisted and deliberately
+// owned here (not as CategorySection local state): swapping a category body
+// for the rename input changes the height of content ABOVE the virtualized
+// recents list, and the shared-scroll offset only re-measures on a render of
+// the sidebar tree — ChatSidebar subscribes to this atom to guarantee that.
+export const $editingCategoryId = atom<null | string>(null)
+
+export function setEditingCategoryId(categoryId: null | string) {
+  $editingCategoryId.set(categoryId)
+}
+
+export function removeSessionFromCategory(sessionId: string, categoryId: string) {
+  $sessionCategories.set(
+    $sessionCategories
+      .get()
+      .map(category =>
+        category.id === categoryId
+          ? { ...category, sessionIds: category.sessionIds.filter(id => id !== sessionId) }
+          : category
+      )
+  )
 }

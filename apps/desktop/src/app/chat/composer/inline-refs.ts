@@ -19,7 +19,12 @@ export interface SessionDragPayload {
 
 export function writeSessionDrag(transfer: DataTransfer, payload: SessionDragPayload) {
   transfer.setData(HERMES_SESSION_MIME, JSON.stringify(payload))
-  transfer.effectAllowed = 'copy'
+  // effectAllowed must cover EVERY drop target's dropEffect: per the HTML DnD
+  // spec, the browser cancels a drop whose dropEffect isn't permitted by
+  // effectAllowed — the drop event silently never fires. 'copyMove' allows
+  // both the composer/chat targets ('copy') and the sidebar category targets
+  // ('move').
+  transfer.effectAllowed = 'copyMove'
 }
 
 export function dragHasSession(transfer: DataTransfer | null) {

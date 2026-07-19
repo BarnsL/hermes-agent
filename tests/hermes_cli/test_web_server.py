@@ -1098,6 +1098,47 @@ class TestWebServerEndpoints:
         row = next(s for s in rows if s["id"] == "session-no-cwd")
         assert row["cwd"] is None
 
+    def test_session_detail_reads_while_gateway_writer_holds_database(self):
+        """Desktop reads must not run SessionDB's schema-writing initializer.
+
+        A live gateway can hold a write transaction while the sidebar fetches
+        session detail. WAL readers should still get the last committed
+        snapshot; a writable per-request SessionDB instead attempts DDL during
+        construction and fails with ``database is locked``.
+        """
+        import sqlite3
+
+        import hermes_state
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="locked-read", source="desktop")
+        finally:
+            db.close()
+
+        writer = sqlite3.connect(
+            str(hermes_state.DEFAULT_DB_PATH),
+            timeout=0.1,
+            isolation_level=None,
+        )
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?",
+                ("not committed", "locked-read"),
+            )
+
+            response = self.client.get("/api/sessions/locked-read")
+
+            assert response.status_code == 200
+            assert response.json()["id"] == "locked-read"
+            assert response.json()["title"] is None
+        finally:
+            writer.rollback()
+            writer.close()
+
     def test_get_sessions_forwards_min_messages(self, monkeypatch):
         """The ?min_messages= filter must reach SessionDB.
 

@@ -297,7 +297,11 @@ export function getSessionMessages(id: string, profile?: string | null): Promise
 
   return window.hermesDesktop.api<SessionMessagesResponse>({
     ...(profile ? { profile } : {}),
-    path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
+    path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`,
+    // Large transcripts are legitimate and the backend deliberately performs
+    // this SQLite/decode work off the event loop. Do not turn a slow-but-live
+    // read into a blank resumed chat at the generic 15-second API timeout.
+    timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -1001,7 +1005,11 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
     body: {
       data_url: dataUrl,
       mime_type: mimeType
-    }
+    },
+    // CV-011: STT can legitimately take up to the backend's 90s command-
+    // provider budget (cold ConversoAR fallback ≈ 40s); the 15s default
+    // discarded completed transcriptions (2026-07-18 incident).
+    timeoutMs: 120_000
   })
 }
 
@@ -1009,7 +1017,9 @@ export function speakText(text: string): Promise<AudioSpeakResponse> {
   return window.hermesDesktop.api<AudioSpeakResponse>({
     path: '/api/audio/speak',
     method: 'POST',
-    body: { text }
+    body: { text },
+    // CV-011: TTS synth (ConversoAR/Chatterbox first-gen) can exceed 15s.
+    timeoutMs: 120_000
   })
 }
 

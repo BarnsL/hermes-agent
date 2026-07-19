@@ -25,7 +25,8 @@ import {
   screen,
   session,
   shell,
-  systemPreferences
+  systemPreferences,
+  Tray
 } from 'electron'
 import nodePty from 'node-pty'
 
@@ -798,6 +799,14 @@ function registerMediaProtocol() {
 let mainWindow = null
 let hermesProcess = null
 let connectionPromise = null
+// System-tray state (Windows/Linux). `tray` holds the Tray instance; `isQuitting`
+// is true ONLY when the user chose Quit from the tray menu (distinct from
+// isQuittingForHandoff, the updater/uninstall handoff flag) so a window 'close'
+// hides to the tray instead of exiting. `startHiddenPending` boots straight to the
+// tray for the login autostart (Hermes.exe --hidden).
+let tray = null
+let isQuitting = false
+let startHiddenPending = process.argv.includes('--hidden')
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
@@ -6952,6 +6961,71 @@ function focusWindow(win) {
   win.focus()
 }
 
+function createTray() {
+  // System-tray icon (Windows/Linux only; macOS keeps the app alive via the Dock).
+  // Restores the pre-2026-07-14 behavior the update dropped: a persistent tray with
+  // Open / Restart / Quit, double-click to restore, and close-to-tray (see the
+  // window 'close' handler). Faithfully ported from the pre-refactor monolith
+  // (Hermes-Purple-Industries/hermes-modifications/tray-icon/main.cjs).
+  if (IS_MAC) {
+    return
+  }
+  if (tray && !tray.isDestroyed()) {
+    return
+  }
+
+  const trayIconPath = getAppIconPath()
+  if (!trayIconPath) {
+    rememberLog('[tray] no icon found for tray; skipping')
+    return
+  }
+
+  const trayIcon = nativeImage.createFromPath(trayIconPath).resize({ width: 16, height: 16 })
+  tray = new Tray(trayIcon)
+  tray.setToolTip('Hermes Agent')
+
+  const showOrCreate = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createWindow()
+    } else {
+      focusWindow(mainWindow)
+    }
+  }
+
+  const contextMenu = Menu.buildFromTemplate([
+    { label: 'Open Hermes', click: showOrCreate },
+    {
+      label: 'Restart Hermes',
+      click: () => {
+        // Tear down the backend, then reload the window — its did-finish-load
+        // re-runs startHermes() and boots a fresh backend.
+        stopBackendChild(hermesProcess)
+        stopAllPoolBackends()
+        setTimeout(() => {
+          if (!mainWindow || mainWindow.isDestroyed()) {
+            createWindow()
+          } else {
+            mainWindow.reload()
+            focusWindow(mainWindow)
+          }
+        }, 400)
+      }
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit Hermes',
+      click: () => {
+        isQuitting = true
+        app.quit()
+      }
+    }
+  ])
+
+  tray.setContextMenu(contextMenu)
+  tray.on('double-click', showOrCreate)
+  rememberLog('[tray] system tray icon created')
+}
+
 function spawnSecondaryWindow({
   sessionId,
   watch,
@@ -7216,6 +7290,13 @@ function createWindow() {
   }
 
   mainWindow.once('ready-to-show', () => {
+    // The login autostart launches Hermes.exe with --hidden to boot straight to
+    // the tray: skip the first show so only the tray icon is visible until the
+    // user opens it. Applies to the cold-start window only; later windows show.
+    if (startHiddenPending) {
+      startHiddenPending = false
+      return
+    }
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.show()
     }
@@ -7232,12 +7313,29 @@ function createWindow() {
   mainWindow.on('moved', schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
-  mainWindow.on('close', () => schedulePersistWindowState.flush())
+  mainWindow.on('close', (event) => {
+    schedulePersistWindowState.flush()
+    // Close-to-tray on Win/Linux: hide instead of quit, unless the user chose Quit
+    // from the tray menu or an update/uninstall handoff is exiting. If the tray
+    // failed to create, fall through to the normal close so the app can still exit.
+    if (!IS_MAC && !isQuitting && !isQuittingForHandoff && tray && !tray.isDestroyed()) {
+      event.preventDefault()
+      mainWindow.hide()
+      rememberLog('[tray] window hidden to system tray')
+    }
+  })
 
   // The overlay rides the main window — closing the app's primary window must
   // tear it down too (otherwise it strands as an orphan that blocks
   // window-all-closed from quitting on Windows/Linux).
-  mainWindow.on('closed', () => closePetOverlay())
+  mainWindow.on('closed', () => {
+    closePetOverlay()
+    // Tear the tray down only on a real quit (not a hide-to-tray).
+    if (isQuitting && tray && !tray.isDestroyed()) {
+      tray.destroy()
+      tray = null
+    }
+  })
 
   wireCommonWindowHandlers(mainWindow, zoomWiringForWindowKind('chat'))
 
@@ -7856,7 +7954,16 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   // defeating the deletion and leaving a zombie process.
   const routeProfile = resolveRouteProfile(tornDownProfile, profile)
   const connection = await ensureBackend(routeProfile)
-  const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+  // CV-011 (2026-07-18): /api/audio/* (transcribe + speak) legitimately runs
+  // up to the backend's 90s STT command-provider budget (ConversoAR cold
+  // fallback ≈ 40s server-side), but the 15s dead-backend default killed the
+  // socket mid-transcription and the finished result was discarded (7/18
+  // 19:25 incident). Audio calls get a 120s ceiling; everything else keeps
+  // the deliberately-fast default (see src/hermes.ts #48504 comment).
+  const timeoutMs = resolveTimeoutMs(
+    request?.timeoutMs,
+    String(request?.path || '').startsWith('/api/audio/') ? 120_000 : DEFAULT_FETCH_TIMEOUT_MS
+  )
 
   const requestPath = pathWithGlobalRemoteProfile(request.path, profile, {
     globalRemote: globalRemoteActive(),
@@ -9027,6 +9134,7 @@ app.whenReady().then(() => {
   configureSpellChecker()
   registerPowerResumeListeners()
   createWindow()
+  createTray()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
@@ -9071,6 +9179,14 @@ function configureSpellChecker() {
 }
 
 app.on('before-quit', () => {
+  // Any before-quit means we're really exiting: let the window 'close' handler
+  // proceed (rather than hide to tray) and remove the tray icon.
+  isQuitting = true
+  if (tray && !tray.isDestroyed()) {
+    tray.destroy()
+    tray = null
+  }
+
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
@@ -9109,7 +9225,15 @@ app.on('window-all-closed', () => {
   // the bundle and relaunch — without this the script's PID-wait spins to its
   // full timeout and the user is left with an invisible app (or an uninstall
   // that appears to do nothing).
-  if (process.platform !== 'darwin' || isQuittingForHandoff) {
+  // With close-to-tray the primary window HIDES (isn't destroyed), so this
+  // normally won't fire while the tray is alive — the app stays resident in the
+  // tray. Still quit for an update/uninstall handoff, on an explicit Quit, or on
+  // Win/Linux when there is no tray to fall back to (the original behavior).
+  if (
+    isQuittingForHandoff ||
+    isQuitting ||
+    (process.platform !== 'darwin' && (!tray || tray.isDestroyed()))
+  ) {
     app.quit()
   }
 })

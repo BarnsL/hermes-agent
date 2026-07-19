@@ -131,7 +131,8 @@ describe('Hermes REST session helpers', () => {
 
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 

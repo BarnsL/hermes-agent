@@ -4963,6 +4963,47 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _thread_started_by_bot(self, channel: Any) -> bool:
+        """True when *channel* is a thread THIS bot created (owner_id == self).
+
+        ── RCA 2026-07-12 (Bishi report); RE-APPLIED 2026-07-16 ──────────────
+        This fix was working-tree-only on 2026-07-12 and was WIPED by the
+        2026-07-14 Hermes update to `main` (it was never committed to git — see
+        DISCORD_ISSUES DISCORD-006). Re-applied here.
+
+        Nous Man opened the threads "we gotta mind break" and "what do u think
+        of the contents of this channel" in #manufactured-culture (both show
+        "Started by Nous Man"), yet inside them it refused to answer unless it
+        was re-@mentioned every message. Cause: `thread_require_mention: true`
+        (set to kill an EARLIER regression where the bot answered every message
+        in a forum thread it had merely posted in) forces `in_bot_thread` False
+        for ALL threads — including the bot's own.
+
+        Fix: gate free-response on thread OWNERSHIP, not mere participation.
+        Discord stamps a thread's ``owner_id`` with its creator; threads Hermes
+        auto-opens on an @mention (or opens via the discord tool) are bot-owned,
+        while a forum/other-user thread the bot only replied in is NOT. So the
+        bot follows up in ITS OWN threads without a re-@mention, while channels
+        and other-owned threads still require an explicit @mention — the earlier
+        "answers-every-message-in-a-forum-thread" regression does not return.
+
+        Injection surface stays bounded: the discord-security plugin still clamps
+        every channel/thread turn to the read/search safe toolset (host tools are
+        operator-DM-only), so free response in a bot-owned public thread can only
+        ever web-search / read / social-fetch.
+
+        Fails closed (returns False) on any error, so an unknown/None owner keeps
+        the @mention requirement.
+        """
+        try:
+            client = self._client
+            if not client or not getattr(client, "user", None):
+                return False
+            owner_id = getattr(channel, "owner_id", None)
+            return owner_id is not None and str(owner_id) == str(client.user.id)
+        except Exception:
+            return False
+
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
         configured = self.config.extra.get("history_backfill")
@@ -6204,12 +6245,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 or is_voice_linked_channel
             )
 
-            # Skip the mention check if the message is in a thread where
-            # the bot has previously participated (auto-created or replied in)
-            # — UNLESS thread_require_mention is enabled, in which case threads
-            # are gated the same as channels.  Useful when multiple bots share
-            # a thread.
-            in_bot_thread = (
+            # A thread the bot itself STARTED (owner_id == this bot) is the
+            # bot's own conversation space: it answers there WITHOUT a
+            # re-@mention, regardless of thread_require_mention. See
+            # _thread_started_by_bot() for the full RCA (2026-07-12,
+            # re-applied 2026-07-16) — ownership (not mere participation) is the
+            # gate, so this does NOT revive the earlier "answers-every-message-
+            # in-a-forum-thread" regression.
+            bot_owns_thread = is_thread and self._thread_started_by_bot(message.channel)
+
+            # Legacy participation bypass: skip the mention check in a thread the
+            # bot has previously participated in — but ONLY when
+            # thread_require_mention is disabled. With it enabled (our config),
+            # this clause is inert and only bot-OWNED threads get free response.
+            in_bot_thread = bot_owns_thread or (
                 is_thread
                 and thread_id in self._threads
                 and not self._discord_thread_require_mention()
@@ -6541,6 +6590,23 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 if _backfill_text:
                     _channel_context = _backfill_text
+
+                # Hardcoded fix (2026-07-18): threads inherit parent channel context.
+                # When a bot-created thread starts, the thread itself has no history,
+                # but the parent channel has the conversation that led to the thread.
+                # Fetch parent messages so the bot knows what the thread is about.
+                if is_thread:
+                    _parent_channel = getattr(message.channel, "parent", None)
+                    if _parent_channel is not None:
+                        _parent_context = await self._fetch_channel_context(
+                            _parent_channel, before=message, reply_target=_reply_target,
+                        )
+                        if _parent_context:
+                            _parent_header = f"[Parent channel context — messages from #{getattr(_parent_channel, 'name', 'unknown')} before this thread was created]\n"
+                            if _channel_context:
+                                _channel_context = f"{_parent_header}{_parent_context}\n\n[Thread messages]\n{_channel_context}"
+                            else:
+                                _channel_context = f"{_parent_header}{_parent_context}"
 
         # Defense-in-depth: prevent empty user messages from entering session
         # (can happen when user sends @mention-only with no other text).

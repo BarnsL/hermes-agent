@@ -571,12 +571,17 @@
   }
 }
 
+/* Transform-only sweep so the arc animates on the compositor. The ::before is a
+   300%-sized gradient layer, so translate(-10%,-10%) → translate(-50%,-50%) of
+   its own box equals the old background-position 15% → 75% sweep at
+   background-size 300% — but without per-frame main-thread style recalc and
+   re-raster of every working row (background-position is a paint property). */
 @keyframes arc-border {
   0% {
-    background-position: 15% 15%;
+    transform: translate(-10%, -10%);
   }
   100% {
-    background-position: 75% 75%;
+    transform: translate(-50%, -50%);
   }
 }
 
@@ -657,11 +662,16 @@
   }
 }
 
+/* Oversized (300%) layer translated by the arc-border keyframes; the parent's
+   overflow:hidden + mask clip it to the ring, so the visible sweep is identical
+   to the old background-position animation. */
 .arc-border::before {
   content: '';
   position: absolute;
-  inset: 0;
-  border-radius: inherit;
+  top: 0;
+  left: 0;
+  width: 300%;
+  height: 300%;
   background: linear-gradient(
     var(--arc-angle),
     transparent 0%,
@@ -678,13 +688,21 @@
     var(--arc-c0) 95%,
     var(--arc-c1) 100%
   );
-  background-size: 300% 300%;
   animation: arc-border var(--arc-duration) linear infinite;
 }
 
 /* Flip the arc's travel direction (e.g. the Nous Portal hero row). */
 .arc-border.arc-reverse::before {
   animation-direction: reverse;
+}
+
+/* The collapsed sidebar keeps its contents mounted offscreen for the
+   hover-reveal slide ($sidebarOverlayMounted), so working-session arcs would
+   otherwise tick forever behind a hidden pane. Pause them while the pane is
+   closed; hovering the reveal container or keyboard-pinning it (data-forced)
+   resumes instantly. */
+[data-pane-open='false']:not(:hover):not([data-forced]) .arc-border::before {
+  animation-play-state: paused;
 }
 
 /* Nous Portal hero: slower, blue → orange arc. */
@@ -1247,13 +1265,28 @@ text-* variant utilities. */ .btn-arc {
 }
 
 [data-slot='aui_assistant-message-content'] .aui-md [data-slot='code-card'][data-streaming='true'] {
-  animation:
-    code-card-stream-enter 180ms cubic-bezier(0.16, 1, 0.3, 1) both,
-    code-card-stream-glow 1.8s ease-in-out 180ms infinite alternate;
+  animation: code-card-stream-enter 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
   border-color: color-mix(in srgb, var(--dt-ring) 24%, var(--ui-stroke-tertiary));
   box-shadow:
     0 0 0 0.0625rem color-mix(in srgb, var(--dt-ring) 10%, transparent),
     0 0.625rem 1.75rem color-mix(in srgb, var(--dt-ring) 8%, transparent);
+}
+
+/* Streaming pulse. Used to be code-card-stream-glow animating border-color +
+   box-shadow on the card itself — paint properties, so the card bounds plus
+   the shadow extent repainted every frame for the life of the stream (and fed
+   the composer's backdrop-filter above). The outer glow is now the static
+   shadow above; the pulse is an inset ring on an ::after animating only
+   opacity, which composites without repaint. (The card's overflow-hidden clips
+   outside-the-bounds pseudo-element shadows, hence inset.) */
+[data-slot='aui_assistant-message-content'] .aui-md [data-slot='code-card'][data-streaming='true']::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 0.0625rem color-mix(in srgb, var(--dt-ring) 12%, transparent);
+  animation: code-card-stream-pulse 1.8s ease-in-out 180ms infinite alternate;
 }
 
 [data-slot='aui_assistant-message-content']
@@ -1547,25 +1580,24 @@ text-* variant utilities. */ .btn-arc {
   }
 }
 
-@keyframes code-card-stream-glow {
+/* Opacity-only so the pulse runs on the compositor (see the ::after rule). */
+@keyframes code-card-stream-pulse {
   from {
-    border-color: color-mix(in srgb, var(--dt-ring) 18%, var(--ui-stroke-tertiary));
-    box-shadow:
-      0 0 0 0.0625rem color-mix(in srgb, var(--dt-ring) 6%, transparent),
-      0 0.5rem 1.5rem color-mix(in srgb, var(--dt-ring) 5%, transparent);
+    opacity: 0.4;
   }
 
   to {
-    border-color: color-mix(in srgb, var(--dt-ring) 32%, var(--ui-stroke-tertiary));
-    box-shadow:
-      0 0 0 0.0625rem color-mix(in srgb, var(--dt-ring) 12%, transparent),
-      0 0.75rem 2rem color-mix(in srgb, var(--dt-ring) 10%, transparent);
+    opacity: 1;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
   [data-slot='aui_assistant-message-content'] .aui-md [data-slot='code-card'][data-streaming='true'] {
     animation: none;
+  }
+
+  [data-slot='aui_assistant-message-content'] .aui-md [data-slot='code-card'][data-streaming='true']::after {
+    display: none;
   }
 }
 

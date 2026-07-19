@@ -1477,6 +1477,15 @@ export const ja = defineLocale({
     noMatch: query => `"${query}" に一致するセッションがありません。`,
     results: '結果',
     pinned: 'ピン留め',
+    categories: {
+      sectionLabel: 'カテゴリ',
+      newCategory: '新しいカテゴリ',
+      defaultName: '新しいカテゴリ',
+      menu: 'カテゴリ操作',
+      rename: '名前を変更',
+      delete: '削除',
+      dropHint: 'ここにセッションをドロップ'
+    },
     sessions: 'セッション',
     cronJobs: 'Cronジョブ',
     groupAriaGrouped: 'セッションを単一リストとして表示',
