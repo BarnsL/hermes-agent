@@ -159,3 +159,56 @@ class TestCombinedGuards:
             error = get_read_block_error(str(cache))
             assert error is not None
             assert "internal Hermes cache" in error
+
+
+class TestHermesDenyPathsExtension:
+    """HERMES_DENY_PATHS (2026-07-18 harness hardening): user-configured
+    directories must be denied for BOTH reads and writes by the direct file
+    tools. Added so the machine-local plaintext-secrets dir (D:\secrets on
+    this box) is not silently readable/writable via file tools
+    (CODING-HARNESS-REVIEW-2026-07-16, HIGH)."""
+
+    def test_deny_paths_blocks_read_and_write(self, tmp_path, monkeypatch):
+        import os
+
+        from agent.file_safety import (
+            get_extra_denied_prefixes,
+            get_read_block_error,
+            is_write_denied,
+        )
+
+        secret_dir = tmp_path / "secrets"
+        secret_dir.mkdir()
+        target = secret_dir / "token.txt"
+        target.write_text("s3cr3t")
+
+        monkeypatch.setenv("HERMES_DENY_PATHS", str(secret_dir))
+
+        assert get_extra_denied_prefixes() == [str(secret_dir.resolve()) + os.sep]
+        assert get_read_block_error(str(target)) is not None
+        assert is_write_denied(str(target))
+        # Paths outside the denied dir are untouched.
+        outside = tmp_path / "ok.txt"
+        assert get_read_block_error(str(outside)) is None
+        assert not is_write_denied(str(outside))
+
+    def test_deny_paths_unset_is_noop(self, tmp_path, monkeypatch):
+        from agent.file_safety import get_extra_denied_prefixes
+
+        monkeypatch.delenv("HERMES_DENY_PATHS", raising=False)
+        assert get_extra_denied_prefixes() == []
+
+    def test_deny_paths_multiple_entries_pathsep(self, tmp_path, monkeypatch):
+        import os
+
+        from agent.file_safety import get_extra_denied_prefixes, is_write_denied
+
+        a = tmp_path / "a"
+        b = tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        monkeypatch.setenv("HERMES_DENY_PATHS", f"{a}{os.pathsep}{b}")
+        prefixes = get_extra_denied_prefixes()
+        assert len(prefixes) == 2
+        assert is_write_denied(str(a / "x"))
+        assert is_write_denied(str(b / "y"))

@@ -59,7 +59,14 @@ def build_write_denied_paths(home: str) -> set[str]:
 
 
 def build_write_denied_prefixes(home: str) -> list[str]:
-    """Return sensitive directory prefixes that must never be written."""
+    """Return sensitive directory prefixes that must never be written.
+
+    Extended by ``HERMES_DENY_PATHS`` (see :func:`get_extra_denied_prefixes`)
+    so machine-local secret directories can be protected without editing
+    this file — e.g. a plaintext-secrets folder outside the home dir that
+    the built-in list cannot know about (CODING-HARNESS-REVIEW-2026-07-16,
+    HIGH: secrets read + unrestricted egress).
+    """
     return [
         os.path.realpath(p) + os.sep
         for p in [
@@ -74,7 +81,38 @@ def build_write_denied_prefixes(home: str) -> list[str]:
             os.path.join(home, ".config", "gh"),
             os.path.join(home, ".config", "gcloud"),
         ]
-    ]
+    ] + get_extra_denied_prefixes()
+
+
+def get_extra_denied_prefixes() -> list[str]:
+    """Return user-configured deny-listed directory prefixes.
+
+    Reads ``HERMES_DENY_PATHS`` — ``os.pathsep``-separated directory paths
+    (same convention as ``HERMES_WRITE_SAFE_ROOT``). Every listed directory
+    is denied for BOTH writes (via :func:`build_write_denied_prefixes`) and
+    reads (via :func:`get_read_block_error`). Set it in ``~/.hermes/.env``
+    so it survives updates and applies to every Hermes process on the
+    machine. Empty/unset → no extra denials.
+
+    Same defense-in-depth framing as the rest of this module: the terminal
+    tool can still bypass; this blocks the direct file tools and creates an
+    audit trail.
+    """
+    env = os.getenv("HERMES_DENY_PATHS", "")
+    if not env:
+        return []
+    prefixes: list[str] = []
+    for path in env.split(os.pathsep):
+        path = path.strip()
+        if not path:
+            continue
+        try:
+            resolved = os.path.realpath(os.path.expanduser(path)) + os.sep
+        except (OSError, ValueError):
+            continue
+        if resolved not in prefixes:
+            prefixes.append(resolved)
+    return prefixes
 
 
 def get_safe_write_roots() -> set[str]:
@@ -319,6 +357,21 @@ def get_read_block_error(path: str) -> Optional[str]:
             "If you need to check the file structure, read .env.example instead. "
             "(Defense-in-depth — not a security boundary; the terminal tool can still bypass.)"
         )
+
+    # User-configured deny-listed directories (HERMES_DENY_PATHS): read side.
+    # Mirrors the write-side extension in build_write_denied_prefixes so a
+    # machine-local secrets directory is denied in BOTH directions.
+    extra_prefixes = get_extra_denied_prefixes()
+    if extra_prefixes:
+        resolved_str = str(resolved)
+        for prefix in extra_prefixes:
+            if resolved_str == prefix.rstrip(os.sep) or resolved_str.startswith(prefix):
+                return (
+                    f"Access denied: {path} is inside a user-protected "
+                    "directory (HERMES_DENY_PATHS) and cannot be read "
+                    "directly. (Defense-in-depth — not a security boundary; "
+                    "the terminal tool can still bypass.)"
+                )
 
     return None
 
