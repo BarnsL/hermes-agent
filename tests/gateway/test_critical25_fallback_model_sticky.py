@@ -154,6 +154,52 @@ def test_subscription_quota_400_gets_short_cooldown():
     assert _exhausted_ttl(None) == EXHAUSTED_TTL_DEFAULT_SECONDS
 
 
+def test_windows_registry_token_fallback_survives_stripped_env(monkeypatch):
+    """CRITICAL #25b: a backend launched from a stripped shell environment
+    (dev build, curated launcher) must still resolve the Claude-subscription
+    OAuth token from HKCU\\Environment instead of dying with
+    'No Anthropic credentials found'."""
+    import platform
+
+    if platform.system() != "Windows":
+        import pytest
+
+        pytest.skip("HKCU registry fallback is Windows-only")
+
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # The helper deliberately no-ops under pytest (it cannot sandbox HKCU and
+    # would hijack priority tests on dev machines) — lift the sentinel here,
+    # since exercising the real registry read IS this test's purpose.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    from agent.anthropic_adapter import _windows_user_env_fallback
+
+    # On this machine the registry holds the real setup-token; on CI boxes
+    # without one the helper must return None rather than raise.
+    token = _windows_user_env_fallback()
+    assert token is None or (isinstance(token, str) and token.strip())
+
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            registry_value = str(
+                winreg.QueryValueEx(key, "CLAUDE_CODE_OAUTH_TOKEN")[0] or ""
+            ).strip()
+    except OSError:
+        registry_value = ""
+
+    if registry_value:
+        # When the registry has the token, the fallback must surface it and
+        # full resolution must succeed despite the stripped environment.
+        assert token == registry_value
+        from agent.anthropic_adapter import resolve_anthropic_token
+
+        assert resolve_anthropic_token() == registry_value
+
+
 def test_reasoning_override_disables_thinking_for_local_qwen():
     """Config-side half of the 'does not support thinking' fix: with the
     live config shape (global reasoning_effort: high + per-model false

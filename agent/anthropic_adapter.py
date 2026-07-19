@@ -1272,12 +1272,54 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     return None
 
 
+def _windows_user_env_fallback() -> Optional[str]:
+    """Read ANTHROPIC_TOKEN / CLAUDE_CODE_OAUTH_TOKEN from HKCU\\Environment.
+
+    CRITICAL #25b helper: only consulted when neither var is in the process
+    environment (see call site in resolve_anthropic_token). Returns the first
+    non-empty value in the same priority order as the env-var checks, or None
+    on non-Windows platforms / missing keys / any registry error.
+    """
+    if platform.system() != "Windows":
+        return None
+    # Unit tests monkeypatch env vars to pin resolution priority, but they
+    # cannot sandbox HKCU — on a developer machine with a real setup-token
+    # this fallback would hijack those tests. The registry is real-machine
+    # state; skip it whenever we're inside a pytest test. (Production runs
+    # never set PYTEST_CURRENT_TEST.)
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            for name in ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+                try:
+                    value, _kind = winreg.QueryValueEx(key, name)
+                except OSError:
+                    continue
+                token = str(value or "").strip()
+                if token:
+                    logger.info(
+                        "Anthropic token resolved from HKCU\\Environment %s "
+                        "(process env was missing it — stripped launcher "
+                        "environment; see CRITICAL #25b)",
+                        name,
+                    )
+                    return token
+    except Exception:
+        logger.debug("HKCU Environment token fallback failed", exc_info=True)
+    return None
+
+
 def resolve_anthropic_token() -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
 
     Priority:
       1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
       2. CLAUDE_CODE_OAUTH_TOKEN env var
+      2b. Windows HKCU\\Environment registry fallback for the same two vars
+          (stripped-launcher-env protection, CRITICAL #25b)
       3. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
          — with automatic refresh if expired and a refresh token is available
       4. Anthropic credential_pool OAuth entry (~/.hermes/auth.json)
@@ -1302,6 +1344,25 @@ def resolve_anthropic_token() -> Optional[str]:
         if preferred:
             return preferred
         return cc_token
+
+    # 2b. Windows registry fallback (CRITICAL #25b, 2026-07-18): Claude Code
+    # persists the setup-token as a USER environment variable, i.e. a value
+    # under HKCU\Environment. A process only sees it if every ancestor in its
+    # launch chain inherited it — and dev builds / relaunches spawned from a
+    # stripped or curated shell environment silently don't. That produced
+    # "agent init failed: No Anthropic credentials found" while the registry
+    # (the durable source of truth) held a perfectly valid token, because the
+    # credential_pool entry is only a POINTER (source=env:CLAUDE_CODE_OAUTH_TOKEN,
+    # no access_token value) — every downstream source dead-ends with the env.
+    # Reading HKCU\Environment directly makes token resolution independent of
+    # launcher env hygiene. Windows-only; registry read is cheap and only
+    # attempted when the process env misses both OAuth vars.
+    reg_token = _windows_user_env_fallback()
+    if reg_token:
+        preferred = _prefer_refreshable_claude_code_token(reg_token, creds)
+        if preferred:
+            return preferred
+        return reg_token
 
     # 3. Claude Code credential file
     resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
