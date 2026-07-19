@@ -1785,6 +1785,15 @@ export const zh: Translations = {
     noMatch: query => `没有会话匹配"${query}"。`,
     results: '结果',
     pinned: '已置顶',
+    categories: {
+      sectionLabel: '分类',
+      newCategory: '新建分类',
+      defaultName: '新建分类',
+      menu: '分类操作',
+      rename: '重命名',
+      delete: '删除',
+      dropHint: '将会话拖放到此处'
+    },
     sessions: '会话',
     cronJobs: '定时任务',
     groupAriaGrouped: '以单一列表显示会话',

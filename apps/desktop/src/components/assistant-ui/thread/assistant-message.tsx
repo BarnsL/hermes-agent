@@ -167,7 +167,7 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
         <DropdownMenu onOpenChange={setMenuOpen} open={menuOpen}>
           <DropdownMenuTrigger asChild>
             <TooltipIconButton tooltip={copy.moreActions}>
-              <Codicon name="ellipsis" />
+              <Codicon name="kebab-vertical" />
             </TooltipIconButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" onCloseAutoFocus={e => e.preventDefault()} sideOffset={6}>

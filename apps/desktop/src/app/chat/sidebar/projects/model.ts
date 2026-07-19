@@ -85,13 +85,22 @@ export function useRepoWorktreeMap(
   const [map, setMap] = useState<Record<string, HermesGitWorktree[]>>({})
   const [loading, setLoading] = useState(false)
   const key = useMemo(() => pathListKey(repoPaths), [repoPaths])
+  // Content-stable identity for the probe effect: the raw repoPaths array is
+  // rebuilt (new identity, same content) on every project-tree refresh, and
+  // having it in the effect deps defeated `key`'s whole purpose — every tree
+  // refresh re-spawned a `git worktree list` subprocess per repo (perf
+  // finding, 2026-07-09). This memo only swaps when the CONTENT (key) changes;
+  // depending on repoPaths itself would re-create the identity churn this memo
+  // exists to stabilize, hence the deliberate missing dep.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stableRepoPaths = useMemo(() => repoPaths.slice(), [key])
   // Refetch when a worktree is added/removed so a new lane shows immediately.
   const refreshToken = useStore($worktreeRefreshToken)
 
   useEffect(() => {
     const git = desktopGit()
 
-    if (!enabled || !repoPaths.length || !git?.worktreeList) {
+    if (!enabled || !stableRepoPaths.length || !git?.worktreeList) {
       setMap({})
       setLoading(false)
 
@@ -102,7 +111,7 @@ export function useRepoWorktreeMap(
 
     setLoading(true)
     // Bounded so a many-repo project doesn't spawn a `git` process per repo at once.
-    void mapPool(repoPaths, WORKTREE_PROBE_CONCURRENCY, async repoPath => {
+    void mapPool(stableRepoPaths, WORKTREE_PROBE_CONCURRENCY, async repoPath => {
       try {
         return [repoPath, await git.worktreeList(repoPath)] as const
       } catch {
@@ -115,7 +124,7 @@ export function useRepoWorktreeMap(
     return () => {
       cancelled = true
     }
-  }, [enabled, key, repoPaths, refreshToken])
+  }, [enabled, key, stableRepoPaths, refreshToken])
 
   return [map, loading]
 }

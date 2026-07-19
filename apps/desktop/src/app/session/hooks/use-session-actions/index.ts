@@ -3,9 +3,15 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
 import { revealTreePane } from '@/components/pane-shell/tree/store'
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import {
+  deleteSession,
+  getSessionMessages,
+  SESSION_CREATE_REQUEST_TIMEOUT_MS,
+  SESSION_RESUME_REQUEST_TIMEOUT_MS,
+  setSessionArchived
+} from '@/hermes'
 import { useI18n } from '@/i18n'
-import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages, toChatMessagesAsync } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
@@ -90,7 +96,7 @@ interface SessionActionsOptions {
   getRoutedStoredSessionId: () => null | string
   navigate: NavigateFunction
   onFreshDraftRouteIntent?: () => void
-  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
   resetViewSync: () => void
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
@@ -125,9 +131,13 @@ function applyStoredUsage(stored: { input_tokens?: number | null; output_tokens?
 function reconcileAuthoritativeMessages(
   authoritativeMessages: SessionResumeResponse['messages'],
   previousMessages: ChatMessage[],
-  liveProjection?: Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'>
+  liveProjection?: Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'>,
+  // Cold-resume prefetch hands in a transcript already converted by the
+  // cooperative driver (toChatMessagesAsync) so the largest main-thread chunk
+  // of a session switch happened in yielding slices, not here.
+  preconvertedMessages?: ChatMessage[]
 ): ChatMessage[] {
-  const authoritative = toChatMessages(authoritativeMessages)
+  const authoritative = preconvertedMessages ?? toChatMessages(authoritativeMessages)
   const withLiveProjection = liveProjection ? appendLiveSessionProjection(authoritative, liveProjection) : authoritative
   const reconciled = reconcileResumeMessages(withLiveProjection, previousMessages)
   const withPendingTurn = preserveLocalPendingTurnMessages(reconciled, previousMessages)
@@ -321,7 +331,15 @@ export function useSessionActions({
               : $currentCwd.get().trim() || resolveNewSessionCwd()
 
         const params = await desktopSessionCreateParams(cwd)
-        const created = await requestGateway<SessionCreateResponse>('session.create', params)
+
+        // Outlast backend event-loop stalls (63s observed) instead of dropping
+        // the user's optimistic first message — see hermes.ts.
+        const created = await requestGateway<SessionCreateResponse>(
+          'session.create',
+          params,
+          SESSION_CREATE_REQUEST_TIMEOUT_MS
+        )
+
         const stored = created.stored_session_id ?? null
 
         if (
@@ -414,7 +432,14 @@ export function useSessionActions({
         // Fresh tile → the resolved new-session cwd (project/default), not the
         // primary composer's live cwd.
         const params = await desktopSessionCreateParams(resolveNewSessionCwd().trim())
-        const created = await requestGateway<SessionCreateResponse>('session.create', params)
+
+        // Same stall headroom as the primary create path — see hermes.ts.
+        const created = await requestGateway<SessionCreateResponse>(
+          'session.create',
+          params,
+          SESSION_CREATE_REQUEST_TIMEOUT_MS
+        )
+
         const stored = created.stored_session_id
 
         if (!stored) {
@@ -764,18 +789,24 @@ export function useSessionActions({
         // Watch windows skip the prefetch — lazy resume attaches the live mirror.
         const prefetchPromise = watchWindow ? null : getSessionMessages(storedSessionId, sessionProfile)
 
-        const resumePromise = requestGateway<SessionResumeResponse>('session.resume', {
-          session_id: storedSessionId,
-          cols: 96,
-          source: 'desktop',
-          // Watch windows attach lazily (live mirror). Every other cold resume
-          // gets the gateway's default deferred build: the RPC returns the
-          // transcript immediately instead of blocking the switch on _make_agent
-          // (MCP discovery / prompt build), and the agent pre-warms in the
-          // background while the prefetch above paints the transcript.
-          ...(watchWindow ? { lazy: true } : {}),
-          ...(sessionProfile ? { profile: sessionProfile } : {})
-        })
+        const resumePromise = requestGateway<SessionResumeResponse>(
+          'session.resume',
+          {
+            session_id: storedSessionId,
+            cols: 96,
+            source: 'desktop',
+            // Watch windows attach lazily (live mirror). Every other cold resume
+            // gets the gateway's default deferred build: the RPC returns the
+            // transcript immediately instead of blocking the switch on _make_agent
+            // (MCP discovery / prompt build), and the agent pre-warms in the
+            // background while the prefetch above paints the transcript.
+            ...(watchWindow ? { lazy: true } : {}),
+            ...(sessionProfile ? { profile: sessionProfile } : {})
+          },
+          // Outlast backend event-loop stalls (63s observed) instead of
+          // converting them into resume failures — see hermes.ts.
+          SESSION_RESUME_REQUEST_TIMEOUT_MS
+        )
 
         // The rejection is consumed by the `await` below; this guard only
         // keeps it from surfacing as unhandled while the prefetch settles.
@@ -784,13 +815,24 @@ export function useSessionActions({
         try {
           if (prefetchPromise) {
             const storedMessages = await prefetchPromise
+            // Cooperative conversion (yields every ~150 messages): a 1000+-
+            // message transcript converted synchronously here blocked paint
+            // and input for the whole hydration (session-latency RCA
+            // 2026-07-09). The isCurrentResume() guard below re-checks after
+            // the yields.
+            const convertedPrefetch = await toChatMessagesAsync(storedMessages.messages)
 
             if (isCurrentResume()) {
               const previousMessages = resumedSameSelectedSession
                 ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
                 : $messages.get()
 
-              localSnapshot = reconcileAuthoritativeMessages(storedMessages.messages, previousMessages)
+              localSnapshot = reconcileAuthoritativeMessages(
+                storedMessages.messages,
+                previousMessages,
+                undefined,
+                convertedPrefetch
+              )
               prefetchApplied = true
               prefetchedMessageCount = storedMessages.messages.length
               prefetchedStoredSessionId = storedMessages.session_id || storedSessionId

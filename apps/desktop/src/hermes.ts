@@ -72,6 +72,15 @@ import type {
 export const STARTUP_REQUEST_TIMEOUT_MS = 60_000
 const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
+// session.create / session.resume ACK against a backend whose event loop can
+// stall for tens of seconds under GIL pressure (a 63.1s stall was logged in the
+// wild). The generic 30s default converts such a stall into a hard failure:
+// create drops the user's optimistic first message, resume strands the thread
+// loader into the retry latch. Both are user-awaited one-shot RPCs, so give
+// them enough headroom to outlast the worst observed stall instead of failing
+// a backend that is alive-but-busy.
+export const SESSION_CREATE_REQUEST_TIMEOUT_MS = 120_000
+export const SESSION_RESUME_REQUEST_TIMEOUT_MS = 120_000
 // prompt.submit is effectively fire-and-forget: turn completion is signaled by
 // stream / message.complete events, NOT by the RPC return. A long turn (MoA
 // presets running references + aggregator in series, deep reasoning, large tool
@@ -457,7 +466,11 @@ export function getSessionMessages(id: string, profile?: string | null): Promise
 
   return window.hermesDesktop.api<SessionMessagesResponse>({
     ...(profile ? { profile } : {}),
-    path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
+    path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`,
+    // Large transcripts are legitimate and the backend deliberately performs
+    // this SQLite/decode work off the event loop. Do not turn a slow-but-live
+    // read into a blank resumed chat at the generic 15-second API timeout.
+    timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -1209,7 +1222,11 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
     body: {
       data_url: dataUrl,
       mime_type: mimeType
-    }
+    },
+    // CV-011: STT can legitimately take up to the backend's 90s command-
+    // provider budget (cold ConversoAR fallback ≈ 40s); the 15s default
+    // discarded completed transcriptions (2026-07-18 incident).
+    timeoutMs: 120_000
   })
 }
 
@@ -1217,7 +1234,9 @@ export function speakText(text: string): Promise<AudioSpeakResponse> {
   return window.hermesDesktop.api<AudioSpeakResponse>({
     path: '/api/audio/speak',
     method: 'POST',
-    body: { text }
+    body: { text },
+    // CV-011: TTS synth (ConversoAR/Chatterbox first-gen) can exceed 15s.
+    timeoutMs: 120_000
   })
 }
 

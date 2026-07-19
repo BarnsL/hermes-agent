@@ -28,7 +28,14 @@ import { parseMarkdownIntoBlocks } from '@assistant-ui/react-streamdown'
  * full lex, i.e. exactly the previous behavior.
  */
 
-const EXACT_CACHE_MAX = 64
+// 512 (not 64): sized for multi-session switch-back, not one transcript. A
+// switch re-renders EVERY settled message in the incoming session; with a few
+// large sessions in rotation a 64-entry cache had already evicted the previous
+// session's blocks, so each switch re-lexed the whole transcript (hardening
+// perf finding, re-applied post-merge). Entries only reference block strings
+// of the cached text, so the overhead is bounded and cheap relative to a
+// re-lex.
+const EXACT_CACHE_MAX = 512
 const EXACT_CACHE_MIN_LENGTH = 1024
 const exactCache = new Map<string, string[]>()
 

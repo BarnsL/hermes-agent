@@ -50,6 +50,7 @@ import { openSessionTile, type TileDock } from '@/store/session-states'
 
 import { requestComposerInsertRefs } from './composer/focus'
 import { type SessionDragPayload, sessionInlineRef, sessionLabel } from './composer/inline-refs'
+import { categoryDropZoneAt, type CategoryZoneHit } from './sidebar/category-drop-zones'
 
 /** A chat surface's drag-start geometry: the anchor pane id it advertises
  *  (`data-session-anchor`) and the composer a link drop routes to
@@ -106,6 +107,8 @@ export function startSessionDrag(
   // move before commit, so these always match the released-at position).
   let split: { anchor: string; before?: null | string; pos: TileDock } | null = null
   let link: null | string = null
+  // Sidebar category zone under the pointer (file-into-category drop).
+  let category: CategoryZoneHit | null = null
 
   // The drag SOURCE (sidebar row or tile tab). Captured synchronously — React
   // clears `currentTarget` after the pointerdown handler returns, but this runs
@@ -132,12 +135,40 @@ export function startSessionDrag(
     },
 
     onEnd() {
+      // Runs after onCommit for both commit and abort — clear the highlight
+      // the resolver may have left lit.
+      category?.handle.setIsOver(false)
+      category = null
+
       if (source) {
         source.style.opacity = restoreOpacity
       }
     },
 
     resolveMove(x, y): DropHint | null {
+      // Sidebar category zones first — they sit outside the pane tree (no
+      // EngineZone hosts them), and the registry hit-tests LIVE rects because
+      // the sidebar can scroll mid-drag (see category-drop-zones.ts).
+      const categoryHit = categoryDropZoneAt(x, y)
+
+      if (categoryHit?.categoryId !== category?.categoryId) {
+        category?.handle.setIsOver(false)
+        categoryHit?.handle.setIsOver(true)
+        category = categoryHit
+      }
+
+      if (category) {
+        split = null
+        link = null
+
+        // A groupId no tree zone owns: keeps the grab cursor (a release HERE
+        // commits) without lighting any zone sheet — the category's own ring
+        // is the affordance. pos 'center' so $sessionTileEdgeHover stays
+        // false and the chat surfaces' link overlays behave as over any
+        // non-zone area.
+        return { kind: 'group', groupId: `sidebar-category:${category.categoryId}`, groupIds: [], pos: 'center' }
+      }
+
       const zone = zones.find(z => rectContains(z.rect, x, y))
       const host = zone ? zoneHost.get(zone.id) : null
 
@@ -178,6 +209,14 @@ export function startSessionDrag(
     },
 
     onCommit() {
+      if (category) {
+        // File into the sidebar category. The zone's onDrop resolves the live
+        // id to the durable membership key (see CategorySection.fileSession).
+        category.handle.onDrop(payload)
+
+        return
+      }
+
       if (split) {
         openSessionTile(payload.id, split.pos, split.anchor, split.before)
         // A tile for this session may already exist (openSessionTile is

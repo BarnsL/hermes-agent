@@ -108,6 +108,12 @@ export function useGatewayBoot({
     let reconnecting = false
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let reconnectAttempt = 0
+    // Timestamp (ms) of the last successful 'open'. Guards the immediate-first
+    // reconnect against an open-then-die flap: if the socket only just opened
+    // and died again within ~2s, we fall back to the normal backoff instead of
+    // hot-looping a zero-delay retry. 0 means "never opened", so the first real
+    // drop after a healthy boot still gets the fast path.
+    let lastOpenAt = 0
     // Surface "sign in again" once per disconnect episode, not on every backoff
     // tick — a stale OAuth ticket fails every attempt and would otherwise stack
     // identical error toasts (and their haptics). Reset on the next clean open.
@@ -200,8 +206,20 @@ export function useGatewayBoot({
         return
       }
 
-      // 1s, 2s, 4s … capped at 15s.
-      const delay = Math.min(15_000, 1_000 * 2 ** Math.min(reconnectAttempt, 4))
+      // Schedule: 0, 1s, 2s, 4s, 8s … capped at 15s. The first attempt after a
+      // drop fires immediately to shave the ~1s dead time off every recovery;
+      // subsequent attempts follow the 1s→15s exponential backoff. Because the
+      // immediate attempt consumed reconnectAttempt 0, the exponent is offset by
+      // one so the backoff still reads 1s, 2s, 4s, 8s, 15s.
+      // Flap guard: if the socket opened then died again within the last ~2s,
+      // an immediate retry would hot-loop the flap — use the normal backoff.
+      const flapping = Date.now() - lastOpenAt < 2_000
+
+      const delay =
+        reconnectAttempt === 0 && !flapping
+          ? 0
+          : Math.min(15_000, 1_000 * 2 ** Math.min(Math.max(0, reconnectAttempt - 1), 4))
+
       reconnectAttempt += 1
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null
@@ -346,6 +364,7 @@ export function useGatewayBoot({
         reconnectAttempt = 0
         reauthNotified = false
         escalated = false
+        lastOpenAt = Date.now()
         clearReconnectTimer()
 
         // A revalidate-driven reconnect can rebuild the backend in place when the

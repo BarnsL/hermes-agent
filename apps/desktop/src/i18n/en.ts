@@ -1602,6 +1602,15 @@ export const en: Translations = {
     noMatch: query => `No sessions match “${query}”.`,
     results: 'Results',
     pinned: 'Pinned',
+    categories: {
+      sectionLabel: 'Categories',
+      newCategory: 'New category',
+      defaultName: 'New category',
+      menu: 'Category actions',
+      rename: 'Rename',
+      delete: 'Delete',
+      dropHint: 'Drop sessions here'
+    },
     sessions: 'Sessions',
     cronJobs: 'Cron jobs',
     groupAriaGrouped: 'Show sessions as a single list',

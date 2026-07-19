@@ -3,6 +3,15 @@ import fs from 'node:fs'
 // `hermes serve` announces HERMES_BACKEND_READY; the legacy `hermes dashboard`
 // backend announces HERMES_DASHBOARD_READY. Accept either so the desktop spawn
 // works against both the headless backend and old/dashboard runtimes.
+//
+// CRITICAL #6/#9 (2026-07-06/07): the `(?:BACKEND|DASHBOARD)` alternation is
+// load-bearing — a DASHBOARD-only regex never matches `hermes serve`, so the
+// desktop waits out the announce deadline, kills a healthy backend, and boot-
+// loops. The regression recurs through STALE PACKAGED ARTIFACTS, not source:
+// `hermes update` resets the Python repo but does not rebuild app.asar, and a
+// frontend rebuild that picks up a cached copy of this file repacks the old
+// regex. After any desktop rebuild, verify the packed asar contains
+// 'BACKEND|DASHBOARD' before shipping it.
 const _READY_RE = /^HERMES_(?:BACKEND|DASHBOARD)_READY port=(\d+)/m
 
 // The announcement clock starts the instant the backend process is spawned —

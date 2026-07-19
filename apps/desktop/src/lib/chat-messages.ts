@@ -589,43 +589,6 @@ function toolPartFromStoredCall(call: unknown, fallbackIndex: number): ChatMessa
   }
 }
 
-function applyStoredToolResult(messages: ChatMessage[], toolMessage: SessionMessage): boolean {
-  const toolCallId = toolMessage.tool_call_id || undefined
-  const toolName = toolMessage.tool_name || toolMessage.name || 'tool'
-  const content = toolMessage.content || toolMessage.text || toolMessage.context || toolMessage.name
-
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const message = messages[i]
-
-    if (message.role !== 'assistant') {
-      continue
-    }
-
-    const partIndex = message.parts.findIndex(
-      part =>
-        part.type === 'tool-call' &&
-        ((toolCallId && part.toolCallId === toolCallId) || (!toolCallId && part.toolName === toolName))
-    )
-
-    if (partIndex < 0) {
-      continue
-    }
-
-    const parts = [...message.parts]
-    const existing = parts[partIndex]
-    parts[partIndex] = {
-      ...existing,
-      result: parseStoredToolResult(content),
-      isError: false
-    } as ChatMessagePart
-    messages[i] = { ...message, parts }
-
-    return true
-  }
-
-  return false
-}
-
 function applyStoredToolResultToParts(parts: ChatMessagePart[], toolMessage: SessionMessage): ChatMessagePart[] | null {
   const toolCallId = toolMessage.tool_call_id || undefined
   const toolName = toolMessage.tool_name || toolMessage.name || 'tool'
@@ -704,11 +667,78 @@ function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
   })
 }
 
-export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
+interface ChatMessageTranscriptBuilder {
+  finish: (messageCount: number) => ChatMessage[]
+  step: (message: SessionMessage, index: number) => void
+}
+
+// The stored-transcript conversion state machine, factored out so the sync
+// (`toChatMessages`) and cooperative (`toChatMessagesAsync`) drivers share one
+// implementation and stay byte-identical in output.
+function createChatMessageTranscriptBuilder(): ChatMessageTranscriptBuilder {
   const result: ChatMessage[] = []
   let pendingToolParts: ChatMessagePart[] = []
   let pendingToolTimestamp: number | undefined
   let activeAssistantIndex: null | number = null
+
+  // Tool-result backfill index: latest `result` position of each tool-call
+  // part, by call id and by tool name. A stored `tool` row used to rescan the
+  // whole transcript back-to-front per result — O(N²) on tool-heavy sessions —
+  // so the index turns each backfill into a direct jump. Latest-wins insertion
+  // order mirrors the old backwards scan (the most recent matching call wins).
+  const toolCallMessageIndexById = new Map<string, number>()
+  const toolCallMessageIndexByName = new Map<string, number>()
+
+  const indexToolCallParts = (parts: ChatMessagePart[], messageIndex: number) => {
+    for (const part of parts) {
+      if (part.type !== 'tool-call') {
+        continue
+      }
+
+      if (part.toolCallId) {
+        toolCallMessageIndexById.set(part.toolCallId, messageIndex)
+      }
+
+      toolCallMessageIndexByName.set(part.toolName, messageIndex)
+    }
+  }
+
+  const applyStoredToolResult = (toolMessage: SessionMessage): boolean => {
+    const toolCallId = toolMessage.tool_call_id || undefined
+    const toolName = toolMessage.tool_name || toolMessage.name || 'tool'
+    const content = toolMessage.content || toolMessage.text || toolMessage.context || toolMessage.name
+
+    const messageIndex = toolCallId
+      ? toolCallMessageIndexById.get(toolCallId)
+      : toolCallMessageIndexByName.get(toolName)
+
+    if (messageIndex === undefined) {
+      return false
+    }
+
+    const message = result[messageIndex]
+
+    const partIndex = message.parts.findIndex(
+      part =>
+        part.type === 'tool-call' &&
+        ((toolCallId && part.toolCallId === toolCallId) || (!toolCallId && part.toolName === toolName))
+    )
+
+    if (partIndex < 0) {
+      return false
+    }
+
+    const parts = [...message.parts]
+    const existing = parts[partIndex]
+    parts[partIndex] = {
+      ...existing,
+      result: parseStoredToolResult(content),
+      isError: false
+    } as ChatMessagePart
+    result[messageIndex] = { ...message, parts }
+
+    return true
+  }
 
   const clearPendingTools = () => {
     pendingToolParts = []
@@ -730,6 +760,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     active.parts = [...active.parts, ...parts]
     active.timestamp = timestamp ?? active.timestamp
+    indexToolCallParts(parts, activeAssistantIndex)
 
     return true
   }
@@ -747,12 +778,13 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         timestamp: pendingToolTimestamp
       })
       activeAssistantIndex = result.length - 1
+      indexToolCallParts(pendingToolParts, activeAssistantIndex)
     }
 
     clearPendingTools()
   }
 
-  messages.forEach((message, index) => {
+  const step = (message: SessionMessage, index: number) => {
     if (message.role === 'tool') {
       const updatedPendingToolParts = applyStoredToolResultToParts(pendingToolParts, message)
 
@@ -762,7 +794,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         return
       }
 
-      if (applyStoredToolResult(result, message)) {
+      if (applyStoredToolResult(message)) {
         return
       }
 
@@ -832,6 +864,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       if (activeAssistant && (currentHasToolCall || activeHasToolCall)) {
         activeAssistant.parts = [...activeAssistant.parts, ...parts]
         activeAssistant.timestamp = message.timestamp ?? activeAssistant.timestamp
+        indexToolCallParts(parts, activeAssistantIndex as number)
 
         return
       }
@@ -847,16 +880,70 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     })
 
     activeAssistantIndex = message.role === 'assistant' ? result.length - 1 : null
-  })
-  flushPendingTools(messages.length)
+    indexToolCallParts(parts, result.length - 1)
+  }
 
-  const withoutGeneratedImageEchoes = result.map(message =>
-    message.role === 'assistant' ? { ...message, parts: dedupeGeneratedImageEchoesInParts(message.parts) } : message
-  )
+  const finish = (messageCount: number): ChatMessage[] => {
+    flushPendingTools(messageCount)
 
-  return withUniqueToolCallIds(
-    withoutGeneratedImageEchoes.filter(m => chatMessageText(m).trim() || m.parts.some(part => part.type !== 'text'))
-  )
+    const withoutGeneratedImageEchoes = result.map(message =>
+      message.role === 'assistant' ? { ...message, parts: dedupeGeneratedImageEchoesInParts(message.parts) } : message
+    )
+
+    return withUniqueToolCallIds(
+      withoutGeneratedImageEchoes.filter(m => chatMessageText(m).trim() || m.parts.some(part => part.type !== 'text'))
+    )
+  }
+
+  return { finish, step }
+}
+
+export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
+  const builder = createChatMessageTranscriptBuilder()
+
+  for (let index = 0; index < messages.length; index += 1) {
+    builder.step(messages[index], index)
+  }
+
+  return builder.finish(messages.length)
+}
+
+// Yield cadence for `toChatMessagesAsync`: coarse enough that small transcripts
+// finish in one pass, fine enough that a 1000+-message conversion never holds
+// the main thread hostage in a single long task.
+const TO_CHAT_MESSAGES_YIELD_INTERVAL = 150
+
+// Cooperative yield between conversion chunks. Prefer `scheduler.yield()`
+// (continuation-priority, unthrottled) where the platform provides it; fall
+// back to a zero-delay macrotask so input/paint can interleave either way.
+function yieldToEventLoop(): Promise<void> {
+  const candidate = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler
+
+  if (typeof candidate?.yield === 'function') {
+    return candidate.yield()
+  }
+
+  return new Promise(resolve => setTimeout(resolve, 0))
+}
+
+// Cooperative variant of `toChatMessages` for cold-resume transcript hydration:
+// byte-identical output, but yields to the event loop every
+// TO_CHAT_MESSAGES_YIELD_INTERVAL messages so converting a huge stored
+// transcript can't block paint/input in one long task. Keep the sync variant on
+// streaming hot paths — the yield points would only add latency to per-token
+// work that is already incremental.
+export async function toChatMessagesAsync(messages: SessionMessage[]): Promise<ChatMessage[]> {
+  const builder = createChatMessageTranscriptBuilder()
+
+  for (let index = 0; index < messages.length; index += 1) {
+    if (index > 0 && index % TO_CHAT_MESSAGES_YIELD_INTERVAL === 0) {
+      await yieldToEventLoop()
+    }
+
+    builder.step(messages[index], index)
+  }
+
+  return builder.finish(messages.length)
 }
 
 export function preserveLocalAssistantErrors(

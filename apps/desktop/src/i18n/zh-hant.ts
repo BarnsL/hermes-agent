@@ -1482,6 +1482,15 @@ export const zhHant = defineLocale({
     noMatch: query => `沒有工作階段符合「${query}」。`,
     results: '結果',
     pinned: '已釘選',
+    categories: {
+      sectionLabel: '分類',
+      newCategory: '新增分類',
+      defaultName: '新增分類',
+      menu: '分類操作',
+      rename: '重新命名',
+      delete: '刪除',
+      dropHint: '將工作階段拖放到此處'
+    },
     sessions: '工作階段',
     cronJobs: '排程任務',
     groupAriaGrouped: '以單一清單顯示工作階段',

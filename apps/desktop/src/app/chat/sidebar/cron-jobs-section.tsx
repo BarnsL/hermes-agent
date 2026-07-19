@@ -144,7 +144,12 @@ export function SidebarCronJobsSection({
         </button>
       </div>
       {open && (
-        <SidebarGroupContent className="flex max-h-72 flex-col gap-px overflow-x-hidden overflow-y-auto overscroll-contain pb-1.75 compact:max-h-none compact:overflow-visible">
+        // Deliberately NO overscroll-contain on this capped nested scroller:
+        // when its content fits (nothing to scroll) Chromium still latches
+        // wheel events here, and overscroll-contain then stops the scroll
+        // chain — a wheel dead zone over the cron rows. Without it the wheel
+        // chains to the sidebar's shared scroll container.
+        <SidebarGroupContent className="flex max-h-72 flex-col gap-px overflow-x-hidden overflow-y-auto pb-1.75 compact:max-h-none compact:overflow-visible">
           {shown.map(job => (
             <CronJobSidebarRow
               expanded={peekJobId === job.id}

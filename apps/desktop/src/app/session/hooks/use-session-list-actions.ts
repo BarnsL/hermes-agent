@@ -1,4 +1,4 @@
-import { useCallback, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 
 import { getCronJobs, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
 import { sameCronSignature } from '@/lib/session-signatures'
@@ -9,7 +9,13 @@ import {
   normalizeSessionSource
 } from '@/lib/session-source'
 import { setCronJobs } from '@/store/cron'
-import { $pinnedSessionIds, $sessionsLimit, bumpSessionsLimit, SIDEBAR_SESSIONS_PAGE_SIZE } from '@/store/layout'
+import {
+  $pinnedSessionIds,
+  $sessionCategories,
+  $sessionsLimit,
+  bumpSessionsLimit,
+  SIDEBAR_SESSIONS_PAGE_SIZE
+} from '@/store/layout'
 import { ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
 import {
   $messagingSessions,
@@ -39,16 +45,23 @@ const SIDEBAR_EXCLUDED_SOURCES = ['cron', 'subagent', 'tool', ...MESSAGING_SESSI
 // external-platform conversations remain, then split per platform in the UI.
 const MESSAGING_EXCLUDED_SOURCES = ['cron', ...LOCAL_SESSION_SOURCE_IDS]
 
+// Trailing-edge debounce window for the per-turn cron-jobs refresh (see
+// scheduleCronJobsRefresh below).
+const AUXILIARY_SECTIONS_REFRESH_DEBOUNCE_MS = 2_500
+
 // Rows a session refresh must preserve even if the aggregator omits them:
-// in-flight first turns (message_count 0), pinned rows aged off the page, the
-// actively-viewed chat (its "working" flag clears a beat before the aggregator
-// sees the persisted row), and sessions whose turn just settled (same race, but
-// for a chat the user has already navigated away from). Pass `scope` to only
-// keep the active row when it belongs to the profile being paged.
+// in-flight first turns (message_count 0), pinned rows aged off the page,
+// categorized rows aged off the page (a category renders its members from the
+// loaded list, exactly like pins), the actively-viewed chat (its "working"
+// flag clears a beat before the aggregator sees the persisted row), and
+// sessions whose turn just settled (same race, but for a chat the user has
+// already navigated away from). Pass `scope` to only keep the active row when
+// it belongs to the profile being paged.
 function sessionsToKeep(scope?: string): Set<string> {
   const keep = new Set<string>([
     ...$workingSessionIds.get(),
     ...$pinnedSessionIds.get(),
+    ...$sessionCategories.get().flatMap(category => category.sessionIds),
     ...getRecentlySettledSessionIds()
   ])
 
@@ -134,6 +147,35 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     }
   }, [])
 
+  const cronJobsRefreshTimerRef = useRef<null | number>(null)
+
+  // Trailing-edge debounce for the per-turn cron-jobs fan-out. Completed turns
+  // land in bursts (parallel sessions, queued drains), and each refreshSessions
+  // used to fire this fetch straight onto a backend event loop that can already
+  // be stalled. The debounce collapses a burst into one fetch after it quiets;
+  // the 30s jobs interval poll owns steady-state freshness. (Pre-merge this
+  // covered the cron/messaging session slices too — those are now folded into
+  // the batched listSidebarSessions call and need no separate collapse.)
+  const scheduleCronJobsRefresh = useCallback(() => {
+    if (cronJobsRefreshTimerRef.current !== null) {
+      window.clearTimeout(cronJobsRefreshTimerRef.current)
+    }
+
+    cronJobsRefreshTimerRef.current = window.setTimeout(() => {
+      cronJobsRefreshTimerRef.current = null
+      void refreshCronJobs()
+    }, AUXILIARY_SECTIONS_REFRESH_DEBOUNCE_MS)
+  }, [refreshCronJobs])
+
+  useEffect(
+    () => () => {
+      if (cronJobsRefreshTimerRef.current !== null) {
+        window.clearTimeout(cronJobsRefreshTimerRef.current)
+      }
+    },
+    []
+  )
+
   const refreshSessions = useCallback(async () => {
     const requestId = refreshSessionsRequestRef.current + 1
     refreshSessionsRequestRef.current = requestId
@@ -215,9 +257,10 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       }
     }
 
-    // Cron *jobs* are a distinct API (getCronJobs), not a session slice.
-    void refreshCronJobs()
-  }, [profileScope, refreshCronJobs])
+    // Cron *jobs* are a distinct API (getCronJobs), not a session slice —
+    // debounced so a settling burst costs one fetch, not one per turn.
+    scheduleCronJobsRefresh()
+  }, [profileScope, scheduleCronJobsRefresh])
 
   const loadMoreSessions = useCallback(async () => {
     bumpSessionsLimit()
