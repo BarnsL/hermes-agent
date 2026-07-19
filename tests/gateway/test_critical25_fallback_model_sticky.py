@@ -136,6 +136,48 @@ def test_fallback_turn_is_change_detected_not_rewritten():
     assert db.meta_calls == []
 
 
+def test_desktop_persist_never_writes_fallback_model():
+    """Desktop mirror of the gateway guard (defect #5 from the verify pass):
+    _persist_live_session_runtime must not write a fallback model into the
+    session's durable model column. It runs on /model, /fast, /reasoning and
+    after compaction — any of which, during an active fallback, used to
+    re-latch the downgrade on desktop resume."""
+    import json as _json
+
+    from tui_gateway import server as tui_server
+
+    captured = {}
+
+    class _DB:
+        def get_session(self, _sid):
+            return {"model_config": _json.dumps({"gateway_runtime": {}})}
+
+        def update_session_meta(self, session_id, model_config_json, model=None):
+            captured["meta"] = (session_id, _json.loads(model_config_json), model)
+
+    agent = SimpleNamespace(
+        model="qwen2.5:14b-instruct-q4_K_M",
+        provider="custom",
+        base_url="http://localhost:11434/v1/",
+        api_mode="chat_completions",
+        reasoning_config=None,
+        service_tier=None,
+        _fallback_activated=True,
+        _session_db=_DB(),
+    )
+
+    tui_server._persist_live_session_runtime(
+        {"agent": agent, "session_key": "desk-session"}
+    )
+
+    assert "meta" in captured
+    _sid, config, model = captured["meta"]
+    # model=None → COALESCE keeps the user's durable selection.
+    assert model is None
+    # The fallback that actually answered is still visible for diagnostics.
+    assert config.get("fallback_model") == "qwen2.5:14b-instruct-q4_K_M"
+
+
 def test_subscription_quota_400_gets_short_cooldown():
     """A 400-exhausted credential (Anthropic OAuth "out of extra usage") must
     recover in minutes, not the 1-hour default — the subscription's rolling

@@ -2412,10 +2412,25 @@ def _persist_live_session_runtime(session: dict | None) -> None:
                 existing_config = parsed
         model_config = _runtime_model_config(agent, existing_config)
         model = str(getattr(agent, "model", "") or "").strip()
+        # CRITICAL #25 (2026-07-18): the DESKTOP mirror of the gateway guard
+        # at gateway/run.py _sync_session_model_from_agent. This runs on
+        # /model, /fast, /reasoning and after compaction; when a fallback is
+        # active, agent.model is the FALLBACK slug, not the user's selection.
+        # Writing it here re-latched the qwen2.5:14b downgrade on desktop
+        # resume. Never persist a fallback model as the session's durable
+        # model — record it only in the model_config for diagnostics.
+        # update_session_meta COALESCEs, so model=None keeps the stored
+        # selection; the legacy update_session_model branch is skipped
+        # entirely under fallback.
+        fallback_active = bool(getattr(agent, "_fallback_activated", False))
+        if fallback_active:
+            model_config = dict(model_config)
+            model_config["fallback_model"] = model
+        persist_model = None if fallback_active else (model or None)
         if hasattr(db, "update_session_meta"):
-            db.update_session_meta(session_key, json.dumps(model_config), model or None)
-        elif model and hasattr(db, "update_session_model"):
-            db.update_session_model(session_key, model)
+            db.update_session_meta(session_key, json.dumps(model_config), persist_model)
+        elif persist_model and hasattr(db, "update_session_model"):
+            db.update_session_model(session_key, persist_model)
     except Exception:
         logger.debug("failed to persist live session runtime", exc_info=True)
 

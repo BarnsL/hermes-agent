@@ -1663,7 +1663,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 try:
                     from agent.models_dev import get_model_capabilities
 
-                    _fb_caps = get_model_capabilities(agent.model)
+                    # CRITICAL #25 (2026-07-18, verify-pass correction): the
+                    # signature is get_model_capabilities(provider, model) —
+                    # models_dev.py:450. A single-arg call raises TypeError
+                    # and only fails safe because the except below swallows
+                    # it. Pass both args so the gate is intentional: at this
+                    # point agent.provider/agent.model are already the
+                    # FALLBACK's identity (swapped above).
+                    _fb_caps = get_model_capabilities(agent.provider, agent.model)
                     if _fb_caps is None or not getattr(_fb_caps, "supports_reasoning", False):
                         logger.info(
                             "Fallback %s: model does not (verifiably) support "
