@@ -11,7 +11,12 @@ import {
   setSessionArchived
 } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages, toChatMessagesAsync } from '@/lib/chat-messages'
+import {
+  type ChatMessage,
+  preserveLocalAssistantErrors,
+  toChatMessages,
+  toChatMessagesAsync
+} from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'

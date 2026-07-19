@@ -7642,7 +7642,7 @@ function createWindow() {
   mainWindow.on('moved', schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
-  mainWindow.on('close', (event) => {
+  mainWindow.on('close', event => {
     schedulePersistWindowState.flush()
 
     // Close-to-tray on Win/Linux: hide instead of quit, unless the user chose Quit
@@ -9783,11 +9783,7 @@ app.on('window-all-closed', () => {
   // normally won't fire while the tray is alive — the app stays resident in the
   // tray. Still quit for an update/uninstall handoff, on an explicit Quit, or on
   // Win/Linux when there is no tray to fall back to (the original behavior).
-  if (
-    isQuittingForHandoff ||
-    isQuitting ||
-    (process.platform !== 'darwin' && (!tray || tray.isDestroyed()))
-  ) {
+  if (isQuittingForHandoff || isQuitting || (process.platform !== 'darwin' && (!tray || tray.isDestroyed()))) {
     app.quit()
   }
 })
