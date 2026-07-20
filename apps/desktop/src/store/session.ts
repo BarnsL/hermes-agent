@@ -212,6 +212,36 @@ export function mergeSessionPage(
   return survivors.length ? [...survivors, ...merged] : merged
 }
 
+/** Kept ids (pins + category members) that resolve against NO loaded row —
+ *  neither by live id nor by lineage root. `keepIds` in {@link mergeSessionPage}
+ *  only protects rows already in memory; on a cold start a pinned/categorized
+ *  session that has aged past the recents page was never fetched at all, so its
+ *  pin/category entry renders nothing until the user happens to "Load more" far
+ *  enough. These are the ids the sidebar must backfill by direct lookup. */
+export function missingKeptSessionIds(keptIds: Iterable<string>, loadedLists: SessionInfo[][]): string[] {
+  const loaded = new Set<string>()
+
+  for (const list of loadedLists) {
+    for (const session of list) {
+      loaded.add(session.id)
+
+      if (session._lineage_root_id) {
+        loaded.add(session._lineage_root_id)
+      }
+    }
+  }
+
+  const missing: string[] = []
+
+  for (const id of new Set(keptIds)) {
+    if (!loaded.has(id)) {
+      missing.push(id)
+    }
+  }
+
+  return missing
+}
+
 export const $connection = atom<HermesConnection | null>(null)
 export const $gatewayState = atom('idle')
 export const $sessions = atom<SessionInfo[]>([])

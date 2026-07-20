@@ -134,7 +134,10 @@ function CategorySection({
 
   // Members are stored as durable ids (lineage root — see sessionPinId) and
   // resolve through the live session map, which indexes both the durable and
-  // the live id. Ids whose sessions aren't loaded simply don't render.
+  // the live id. Ids whose sessions aren't loaded don't render until the
+  // post-refresh backfill fetches them by id (backfillKeptSessions in
+  // use-session-list-actions.ts) — so a member aged past the recents page
+  // reappears within one refresh instead of vanishing.
   const categorySessions = category.sessionIds
     .map(id => sessionById.get(id))
     .filter((session): session is SessionInfo => Boolean(session))

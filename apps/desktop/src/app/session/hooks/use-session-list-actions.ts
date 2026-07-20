@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 
-import { getCronJobs, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
+import { getCronJobs, getSession, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
 import { sameCronSignature } from '@/lib/session-signatures'
 import {
   isMessagingSource,
@@ -18,12 +18,15 @@ import {
 } from '@/store/layout'
 import { ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
 import {
+  $cronSessions,
   $messagingSessions,
   $selectedStoredSessionId,
   $sessions,
   CRON_SECTION_LIMIT,
   mergeSessionPage,
   MESSAGING_SECTION_LIMIT,
+  missingKeptSessionIds,
+  sessionMatchesStoredId,
   setCronSessions,
   setMessagingPlatformTotals,
   setMessagingSessions,
@@ -76,6 +79,54 @@ function sessionsToKeep(scope?: string): Set<string> {
   }
 
   return keep
+}
+
+// Keep/`sessionsToKeep` only protects rows already in memory. On a cold start a
+// pinned or categorized session that has aged past the recents page is never in
+// the fetched pages at all, so its pin/category entry silently renders nothing
+// (the 2026-07-19 "we lost a lot of sessions" incident: bench probes filled
+// page 1 and every categorized row fell outside it). Backfill those ids with a
+// direct by-id lookup after each refresh. Per-id attempt counts stop a deleted
+// membership from re-probing the backend on every message.complete forever.
+const BACKFILL_MAX_ATTEMPTS = 3
+const BACKFILL_MAX_PER_REFRESH = 30
+const backfillAttempts = new Map<string, number>()
+const backfillInFlight = new Set<string>()
+
+async function backfillKeptSessions(): Promise<void> {
+  const kept = [...$pinnedSessionIds.get(), ...$sessionCategories.get().flatMap(category => category.sessionIds)]
+
+  const missing = missingKeptSessionIds(kept, [$sessions.get(), $cronSessions.get(), $messagingSessions.get()])
+    .filter(id => !backfillInFlight.has(id) && (backfillAttempts.get(id) ?? 0) < BACKFILL_MAX_ATTEMPTS)
+    .slice(0, BACKFILL_MAX_PER_REFRESH)
+
+  await Promise.all(
+    missing.map(async id => {
+      backfillInFlight.add(id)
+
+      try {
+        const session = await getSession(id)
+
+        // A membership pointing at an archived row stays hidden (matching the
+        // recents fetch) instead of resurrecting it inside its category.
+        if (session.archived) {
+          backfillAttempts.set(id, BACKFILL_MAX_ATTEMPTS)
+
+          return
+        }
+
+        backfillAttempts.delete(id)
+        setSessions(prev => (prev.some(s => sessionMatchesStoredId(s, id)) ? prev : [...prev, session]))
+      } catch {
+        // 404 (deleted session, or a member owned by a non-active profile) and
+        // transient backend errors land here alike — count and retry up to the
+        // cap on later refreshes.
+        backfillAttempts.set(id, (backfillAttempts.get(id) ?? 0) + 1)
+      } finally {
+        backfillInFlight.delete(id)
+      }
+    })
+  )
 }
 
 interface UseSessionListActionsArgs {
@@ -253,6 +304,11 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         setMessagingSessions(prev => (sameCronSignature(prev, messagingRows) ? prev : messagingRows))
         // Hit the cap → at least one platform may have more on disk than loaded.
         setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
+
+        // Fire-and-forget: resolve pinned/categorized ids the pages above did
+        // not cover (cold start, or members aged past the page) by direct
+        // lookup, so pins and categories always render their sessions.
+        void backfillKeptSessions()
       }
     } finally {
       if (showLoading && refreshSessionsRequestRef.current === requestId) {

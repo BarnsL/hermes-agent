@@ -12,6 +12,7 @@ import {
   $unreadFinishedSessionIds,
   applyConfiguredDefaultProjectDir,
   mergeSessionPage,
+  missingKeptSessionIds,
   sessionPinId,
   setCurrentCwd,
   setSelectedStoredSessionId,
@@ -372,5 +373,31 @@ describe('unread finished sessions', () => {
 
     setSelectedStoredSessionId('s1')
     expect($unreadFinishedSessionIds.get()).toEqual([])
+  })
+})
+
+describe('missingKeptSessionIds', () => {
+  it('reports kept ids that no loaded list resolves', () => {
+    const loaded = [[session({ id: 'a' })], [session({ id: 'b' })]]
+
+    expect(missingKeptSessionIds(['a', 'b', 'ghost'], loaded)).toEqual(['ghost'])
+  })
+
+  it('resolves a durable pin id through a loaded row lineage root', () => {
+    // Category/pin membership stores the pre-compression root; the loaded page
+    // carries the live tip. The root must count as loaded, not get re-fetched.
+    const loaded = [[session({ id: 'tip', _lineage_root_id: 'root' })]]
+
+    expect(missingKeptSessionIds(['root', 'tip'], loaded)).toEqual([])
+  })
+
+  it('dedupes ids kept by both a pin and a category', () => {
+    expect(missingKeptSessionIds(['ghost', 'ghost'], [[]])).toEqual(['ghost'])
+  })
+
+  it('returns nothing when everything kept is loaded', () => {
+    const loaded = [[session({ id: 'a' }), session({ id: 'b' })]]
+
+    expect(missingKeptSessionIds(['a', 'b'], loaded)).toEqual([])
   })
 })
