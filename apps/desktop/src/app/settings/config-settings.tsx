@@ -476,7 +476,11 @@ export function ConfigSettings({
                     : enumOptionsFor(key, getNested(config, key), config)
                 }
                 onChange={value => updateConfig(setNested(config, key, value))}
-                optionLabels={key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels : undefined}
+                optionLabels={
+                  key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels
+                    : (key === 'tts.provider' || key === 'stt.provider') ? { conversoar: 'ConversoAR' }
+                    : undefined
+                }
                 schema={field}
                 schemaKey={key}
                 value={getNested(config, key)}
