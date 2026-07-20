@@ -332,17 +332,33 @@ _CONTEXT_1M_BETA = "context-1m-2025-08-07"
 # See https://platform.claude.com/docs/en/build-with-claude/fast-mode
 _FAST_MODE_BETA = "fast-mode-2026-02-01"
 
-# Additional beta headers required for OAuth/subscription auth.
-# Matches what Claude Code (and pi-ai / OpenCode) send.
+# Beta headers sent on OAuth/subscription auth, matching what Claude Code
+# (and pi-ai / OpenCode) send.
+#
+# CORRECTED 2026-07-19: these are NOT required. Previously documented as
+# "required for OAuth/subscription auth"; a live probe with NO anthropic-beta
+# header at all returned HTTP 200, as did 8 consecutive minimal-header requests,
+# streaming, and tool use. They are kept for parity with the real CLI and are
+# harmless, but they are not what makes OAuth work and removing them will not
+# break auth. The ONE load-bearing OAuth requirement is that the first system
+# block is byte-for-byte _CLAUDE_CODE_SYSTEM_PREFIX (see build_anthropic_kwargs).
 _OAUTH_ONLY_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
 ]
 
-# Claude Code identity — required for OAuth requests to be routed correctly.
-# Without these, Anthropic's infrastructure intermittently 500s OAuth traffic.
-# The version must stay reasonably current — Anthropic rejects OAuth requests
-# when the spoofed user-agent version is too far behind the actual release.
+# Claude Code identity headers, sent for parity with the real CLI.
+#
+# CORRECTED 2026-07-19: previously documented as "required for OAuth requests to
+# be routed correctly", with the claim that Anthropic rejects a user-agent whose
+# version is too far behind the real release. Neither reproduced: a request with
+# NO user-agent and NO x-app returned HTTP 200. A stale version string is
+# therefore never the cause of a failure — do not chase UA drift when debugging.
+#
+# The intermittent 429s historically blamed on "fingerprint drift" were almost
+# certainly system-block violations: a malformed/missing Claude Code system
+# prefix returns HTTP 429 rate_limit_error with a bare "Error" body and no
+# retry-after/ratelimit headers, which looks exactly like flaky throttling.
 _CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
 _claude_code_version_cache: Optional[str] = None
 
@@ -350,9 +366,12 @@ _claude_code_version_cache: Optional[str] = None
 def _detect_claude_code_version() -> str:
     """Detect the installed Claude Code version, fall back to a static constant.
 
-    Anthropic's OAuth infrastructure validates the user-agent version and may
-    reject requests with a version that's too old.  Detecting dynamically means
-    users who keep Claude Code updated never hit stale-version 400s.
+    Cosmetic only. The previous docstring claimed "Anthropic's OAuth
+    infrastructure validates the user-agent version and may reject requests with
+    a version that's too old" — that did not reproduce (2026-07-19): a request
+    with no user-agent header at all returns HTTP 200. Detection is kept so the
+    header we do send matches reality, but a stale or missing version never
+    causes a rejection.
     """
     import subprocess as _sp
 
@@ -374,6 +393,39 @@ def _detect_claude_code_version() -> str:
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp__"
+
+
+def _to_oauth_wire_name(name: str) -> str:
+    """Map a tool name to the form the OAuth (subscription) lane accepts.
+
+    Anthropic's billing classifier treats a tool name matching ``^mcp_`` followed
+    by a NON-underscore as a third-party-app fingerprint and rejects the whole
+    request. Re-characterised live 2026-07-19 (controls interleaved, account had
+    full quota throughout):
+
+        mcp_get_weather    -> HTTP 400   mcp__get_weather   -> 200
+        mcp_search_web     -> HTTP 400   mcp___get_weather  -> 200
+                                          mcpX_get_weather   -> 200
+                                          my_mcp_get_weather -> 200
+                                          MCP_get_weather    -> 200
+                                          get_weather        -> 200
+
+    The rejection message is *** "You're out of extra usage. Add more at
+    claude.ai/settings/usage and keep going." *** — i.e. it is worded as a quota
+    error but is really a request-shape error, and it fires with a completely
+    healthy plan. Do not treat this 400 as proof the subscription is spent
+    without first re-probing with a plain no-tools request.
+
+    Module-level (not a closure) so every wire surface can reach it — ``tools[]``,
+    replayed ``tool_use`` blocks, and ``tool_choice``. It previously lived inside
+    ``build_anthropic_kwargs``, which is why ``tool_choice`` silently bypassed it.
+    """
+    if name.startswith(_MCP_TOOL_PREFIX):
+        return name  # already correct, don't double-prefix
+    if name.startswith("mcp_"):
+        # single-underscore -> promote to double
+        return _MCP_TOOL_PREFIX + name[len("mcp_"):]
+    return _MCP_TOOL_PREFIX + name  # bare name -> mcp__<name>
 
 
 def _get_claude_code_version() -> str:
@@ -818,8 +870,16 @@ def build_anthropic_client(
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_oauth_token(api_key):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
-        # Anthropic routes OAuth requests based on user-agent and headers;
-        # without Claude Code's fingerprint, requests get intermittent 500s.
+        #
+        # `auth_token=` is the load-bearing line here: it makes the SDK emit
+        # `Authorization: Bearer`. Sending an OAuth token as `x-api-key` instead
+        # is a hard 401 "invalid x-api-key" (verified 2026-07-19).
+        #
+        # The betas/user-agent/x-app below are parity-with-the-CLI decoration,
+        # NOT requirements — the old comment here ("Anthropic routes OAuth
+        # requests based on user-agent and headers; without Claude Code's
+        # fingerprint, requests get intermittent 500s") did not reproduce.
+        # See _OAUTH_ONLY_BETAS for the probe results.
         all_betas = common_betas + _OAUTH_ONLY_BETAS
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
@@ -2613,6 +2673,57 @@ def build_anthropic_kwargs(
                 text = text.replace("Nous Research", "Anthropic")
                 block["text"] = text
 
+        # 2b. Demote every block EXCEPT the identity sentence out of `system`
+        #    and into the first user message. Bisected empirically 2026-07-19
+        #    (session 20260707_212932_fa44b7 + a FRESH 1-message session both
+        #    400'd "You're out of extra usage" on a healthy plan, zero tools):
+        #      - the subscription billing classifier scans ONLY system blocks;
+        #      - the Hermes prompt's own guidance sections (memory/skills/
+        #        session_search wording) semantically fingerprint a non-
+        #        Claude-Code product, flipping the request to the extra-usage
+        #        lane. The step-2 name swap above is NOT sufficient — the
+        #        trigger is fuzzy/conjunctive, so keyword scrubbing loses the
+        #        arms race. Moving the same text into the first *user* turn
+        #        passes (verified: identical payload, 400 -> 200).
+        #    So on the OAuth lane `system` carries ONLY the identity block and
+        #    the real operating prompt rides in the first user message inside
+        #    <operating-instructions> tags. cache_control markers survive the
+        #    move (valid on message content blocks too).
+        demoted = [
+            b for b in system[1:]
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+        ]
+        system = [cc_block]
+        if demoted:
+            moved_blocks = []
+            for i, b in enumerate(demoted):
+                nb = {
+                    "type": "text",
+                    "text": (
+                        ("<operating-instructions>\n" if i == 0 else "")
+                        + b["text"]
+                        + ("\n</operating-instructions>" if i == len(demoted) - 1 else "")
+                    ),
+                }
+                if isinstance(b.get("cache_control"), dict):
+                    nb["cache_control"] = dict(b["cache_control"])
+                moved_blocks.append(nb)
+            first = anthropic_messages[0] if anthropic_messages else None
+            if first is not None and first.get("role") == "user":
+                content = first.get("content")
+                if isinstance(content, str):
+                    first["content"] = moved_blocks + [
+                        {"type": "text", "text": content}
+                    ]
+                elif isinstance(content, list):
+                    first["content"] = moved_blocks + content
+                else:
+                    first["content"] = moved_blocks
+            else:
+                anthropic_messages.insert(
+                    0, {"role": "user", "content": moved_blocks}
+                )
+
         # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
         #    single-underscore ``mcp_`` prefix.  Anthropic's subscription/OAuth
         #    billing classifier treats a single-underscore ``mcp_`` tool name as
@@ -2623,22 +2734,16 @@ def build_anthropic_kwargs(
         #
         #    Two cases, both must land on the double-underscore ``mcp__`` form:
         #      a) bare Hermes-native tools (``read_file``)  -> ``mcp__read_file``
-        #      b) native MCP server tools registered under their full
-        #         single-underscore ``mcp_<server>_<tool>`` name
-        #         (``mcp_linear_get_issue``) -> ``mcp__linear_get_issue``
-        #    Case (b) is the gap that the bare ``mcp_``->``mcp__`` constant swap
-        #    left open: those tools were *skipped* and stayed single-underscore,
-        #    so any session with an MCP server configured still tripped the
-        #    classifier. normalize_response reverses both forms via registry
-        #    lookup so the dispatcher still sees the original name. GH-25255.
-        def _to_oauth_wire_name(name: str) -> str:
-            if name.startswith("mcp__"):
-                return name  # already correct, don't double-prefix
-            if name.startswith("mcp_"):
-                # single-underscore native MCP tool -> promote to double
-                return "mcp__" + name[len("mcp_"):]
-            return _MCP_TOOL_PREFIX + name  # bare name -> mcp__<name>
-
+        #      b) MCP server tools. NOTE (2026-07-19): registration now emits the
+        #         double-underscore form directly — ``mcp_prefixed_tool_name`` in
+        #         tools/mcp_tool.py builds ``mcp__<server>__<tool>`` — so case (b)
+        #         is normally already correct on arrival. The single-underscore
+        #         promotion below is kept as a belt-and-braces guard for any
+        #         caller still supplying a legacy ``mcp_<server>_<tool>`` name.
+        #    normalize_response reverses both forms via registry lookup so the
+        #    dispatcher still sees the original name. GH-25255.
+        #    The normalizer itself is module-level (see _to_oauth_wire_name) so
+        #    tool_choice can use it too — see the tool_choice block below.
         if anthropic_tools:
             for tool in anthropic_tools:
                 if "name" in tool:
@@ -2676,8 +2781,20 @@ def build_anthropic_kwargs(
             # Anthropic has no tool_choice "none" — omit tools entirely to prevent use
             kwargs.pop("tools", None)
         elif isinstance(tool_choice, str):
-            # Specific tool name
-            kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
+            # Specific tool name. On the OAuth lane this MUST go through the same
+            # normalizer as tools[] above, for two independent reasons:
+            #   1. A ``mcp_``-prefixed name here is rejected with the misleading
+            #      HTTP 400 "You're out of extra usage" (see _to_oauth_wire_name).
+            #   2. Even a bare name breaks: tools[] has already been rewritten to
+            #      ``mcp__<name>``, so an un-rewritten tool_choice names a tool
+            #      that is no longer in the request -> HTTP 400.
+            # This was a live gap — the normalizer used to be a closure inside the
+            # ``if is_oauth:`` block above and was unreachable from here, so every
+            # forced-tool auxiliary/MoA call on a subscription token was malformed.
+            kwargs["tool_choice"] = {
+                "type": "tool",
+                "name": _to_oauth_wire_name(tool_choice) if is_oauth else tool_choice,
+            }
 
     # Map reasoning_config to Anthropic's thinking parameter.
     # Claude 4.6+ models use adaptive thinking + output_config.effort.

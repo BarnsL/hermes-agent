@@ -3920,7 +3920,16 @@ def run_conversation(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    # Pass the classified reason (as the rate-limit failover at
+                    # ~3385 and the auth failover at ~3418 already do). Without
+                    # it this terminal path handed try_activate_fallback()
+                    # reason=None, so it could not tell a provider-quota
+                    # exhaustion (FailoverReason.billing — e.g. Anthropic's
+                    # subscription-lane HTTP 400 "You're out of extra usage")
+                    # apart from a genuinely malformed request, and skipped the
+                    # per-reason cooldown bookkeeping that arms
+                    # _rate_limited_until for the provider being abandoned.
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4095,6 +4104,17 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
+                        # Mirror the retries-exhausted return below, which has
+                        # always carried this. A provider-quota wall can arrive
+                        # as a NON-retryable error (Anthropic's subscription
+                        # lane answers HTTP 400 "You're out of extra usage" with
+                        # retryable=False), so without this key the single most
+                        # important failure class exited through the one path
+                        # that reported no reason at all — leaving callers to
+                        # re-guess it from the message text. cli.py's kanban
+                        # worker keys its rate_limit/billing exit codes off
+                        # this, and the gateway uses it to pick user-facing copy.
+                        "failure_reason": classified.reason.value,
                     }
 
                 if retry_count >= max_retries:

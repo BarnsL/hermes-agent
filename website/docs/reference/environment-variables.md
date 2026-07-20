@@ -98,7 +98,7 @@ Hermes reads environment variables from the process environment and, for user-ma
 | `OPENCODE_ZEN_BASE_URL` | Override OpenCode Zen base URL |
 | `OPENCODE_GO_API_KEY` | OpenCode Go API key — $10/month subscription for open models ([opencode.ai](https://opencode.ai/auth)) |
 | `OPENCODE_GO_BASE_URL` | Override OpenCode Go base URL |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Explicit Claude Code token override if you export one manually |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Explicit Claude Code token override if you export one manually (`sk-ant-oat01-…`). **Windows:** this is usually stored in `HKCU\Environment` and is frequently *absent* from an already-running process's environment, so a resolver that only reads `os.environ` will miss it — fall back to a `winreg` read of `HKCU\Environment` |
 | `HERMES_MODEL` | Override model name at process level (used by cron scheduler; prefer `config.yaml` for normal use) |
 | `VOICE_TOOLS_OPENAI_KEY` | Preferred OpenAI key for OpenAI speech-to-text and text-to-speech providers |
 | `HERMES_LOCAL_STT_COMMAND` | Optional local speech-to-text command template. Supports `{input_path}`, `{output_dir}`, `{language}`, and `{model}` placeholders |
@@ -114,7 +114,28 @@ Hermes reads environment variables from the process environment and, for user-ma
 
 ## Provider Auth (OAuth)
 
-For native Anthropic auth, Hermes prefers Claude Code's own credential files when they exist because those credentials can refresh automatically. **OAuth against Anthropic requires a Claude Max plan with purchased extra usage credits** — Hermes routes as Claude Code, which only draws from the Max plan's extra/overage credits, not the base Max allowance, and does not work on Claude Pro. Without Max + extra credits, use an API key instead. Environment variables such as `ANTHROPIC_TOKEN` remain useful as manual overrides, but they are no longer the preferred path for Claude Max login.
+For native Anthropic auth, Hermes prefers Claude Code's own credential files when they exist because those credentials can refresh automatically. Environment variables such as `ANTHROPIC_TOKEN` remain useful as manual overrides, but they are no longer the preferred path for Claude subscription login.
+
+**OAuth against Anthropic effectively requires purchased extra-usage credits for real Hermes workloads.** A *minimal* request on a plain subscription token succeeds — that part is genuinely true and was verified — but a real Hermes agent turn does not, and the difference is the request content, not the plan.
+
+> **Correction history — read this before "fixing" the line above again.**
+> Earlier on 2026-07-19 this paragraph was rewritten to say the extra-credits requirement was false, on the strength of minimal probes returning HTTP 200. **That rewrite was wrong and has been reverted.** Minimal probes are not representative. Re-measured the same day against real dumped Hermes request bodies:
+>
+> - A real Hermes turn returns HTTP 400 `You're out of extra usage` **deterministically, on every model** (opus-4-8, sonnet-4-6, haiku-4-5, fable-5) while a tiny probe on the same token, seconds apart, returns 200.
+> - Bisecting a dumped body: it still 400s with **no tools** and `max_tokens=8000`. Replacing Hermes' second system block with a trivial one returns 200. So the trigger is the system-prompt **content**.
+> - It is **not size**. Neutral filler at the identical character count — and at 42,570 chars / 10,433 tokens, far larger — returns 200, while Hermes' own prompt 400s at ~4,000 tokens. Cutting Hermes' prompt at 16,129 chars returns 200; at 16,295 chars it returns 400. Both results reproduce.
+> - It is **not** the string `Hermes`: substituting it changes nothing.
+>
+> Read that as Anthropic classifying the request as third-party-app usage and routing it to the extra-usage lane, which then reports empty. The practical consequence matches the original wording: **to run Hermes on a Claude subscription, buy extra usage at claude.ai/settings/usage.**
+
+Two related traps:
+
+- The HTTP 400 `You are out of extra usage…` message is **not** always a quota wall. A tool name matching `^mcp_` followed by a non-underscore returns that identical 400 on a perfectly healthy plan. Re-probe with a plain no-tools request before concluding the plan is spent.
+- An HTTP 429 `{"type":"rate_limit_error","message":"Error"}` with **no** `retry-after` and no `anthropic-ratelimit-*` headers is not throttling and retrying cannot fix it. It signals a malformed request, most often the system-prompt contract below.
+
+The one load-bearing requirement for the subscription OAuth lane is that `system` is an array whose **first** block is byte-for-byte `You are Claude Code, Anthropic's official CLI for Claude.`, with your own instructions in a separate second block. `anthropic-beta` headers and the `claude-code/<ver>` User-Agent are optional; a request sending neither returned 200, and a stale User-Agent version is never a rejection cause.
+
+Note that this is a technical description of how the endpoint behaves, not a statement about permitted use: whether a Claude subscription token may be used outside Claude Code itself is governed by Anthropic's terms of service and acceptable use policy. Check those terms and use a Console API key (`ANTHROPIC_API_KEY`) if in any doubt.
 
 | Variable | Description |
 |----------|-------------|

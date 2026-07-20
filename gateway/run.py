@@ -146,6 +146,34 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Provider quota/credit exhaustion — distinct from a rate limit. A rate limit
+# clears in seconds and "try again in a moment" is honest advice; an exhausted
+# balance or spent plan window does NOT, and telling the user to retry sends
+# them into a loop. Checked BEFORE _GATEWAY_RATE_LIMIT_RE so the shared word
+# "usage" cannot mis-route a billing wall into the retry-soon bucket.
+#
+# "out of extra usage" is Anthropic's Claude-subscription phrasing (HTTP 400,
+# not 429) — it matched none of the rate-limit alternatives above ("extra
+# usage" is not "usage limit"), so it fell through every branch to the generic
+# "failed after retries" default. That default was doubly wrong here: the error
+# is classified retryable=False, so no retries were ever attempted.
+_GATEWAY_BILLING_RE = re.compile(
+    r"("
+    r"out\s+of\s+extra\s+usage"       # Anthropic Claude subscription (HTTP 400)
+    r"|extra\s+usage"                 # same family, shorter phrasings
+    r"|insufficient\s+balance"        # z.ai / GLM (HTTP 429, code 1113)
+    r"|insufficient[_\s]quota"        # OpenAI-compatible
+    r"|no\s+resource\s+package"
+    r"|credit\s+balance"              # Anthropic API-key lane
+    r"|billing"
+    r"|payment\s+required"
+    r"|\b402\b"
+    r"|please\s+recharge"
+    r"|add\s+more\s+at"               # trailing half of the Anthropic copy
+    r")",
+    re.IGNORECASE,
+)
+
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
@@ -392,6 +420,16 @@ def _gateway_provider_error_reply(text: str) -> str:
         return (
             "⚠️ The model provider rejected the request. I kept the raw provider "
             "error out of chat; check gateway logs for details or try rephrasing."
+        )
+    # Billing before rate-limit: both mention "usage", but only one is
+    # retry-soon. See _GATEWAY_BILLING_RE for why the Anthropic subscription
+    # wall used to land in the generic bucket below.
+    if _GATEWAY_BILLING_RE.search(text):
+        return (
+            "💳 The model provider is out of quota or credit, so this turn "
+            "could not run. If a fallback provider is configured I'll use it "
+            "automatically; otherwise top up the account or wait for the plan "
+            "window to reset. Raw provider details are in the gateway logs."
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
         return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."

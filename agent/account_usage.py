@@ -747,6 +747,11 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
             fetched_at=_utc_now(),
             unavailable_reason="Anthropic account limits are only available for OAuth-backed Claude accounts.",
         )
+    # CORRECTED 2026-07-19: only "Authorization: Bearer" is load-bearing here.
+    # The anthropic-beta and claude-code User-Agent headers were previously
+    # documented as required for the OAuth lane; a live probe sending neither
+    # returned 200, and a stale UA version is never a rejection cause. They are
+    # kept as-is (harmless, and they match what Claude Code sends).
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",

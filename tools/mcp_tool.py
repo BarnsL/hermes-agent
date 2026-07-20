@@ -3640,12 +3640,20 @@ def _handle_session_expired_and_retry(
 # ``is_mcp_tool_parallel_safe()`` for the parallel-execution check in run_agent.
 _parallel_safe_servers: set = set()
 
-# Exact MCP tool-name provenance. MCP tool names are formatted as
-# ``mcp_{sanitized_server}_{sanitized_tool}``, which is ambiguous when server
-# names contain underscores (``mcp_a_b_tool`` could be server ``a`` + tool
-# ``b_tool`` or server ``a_b`` + tool ``tool``). Keep the server component
-# captured at registration time so parallel safety never relies on prefix
-# guessing.
+# Exact MCP tool-name provenance. Names are now formatted as
+# ``mcp__{sanitized_server}__{sanitized_tool}`` (double underscore as both the
+# prefix and the delimiter — see ``mcp_prefixed_tool_name``). The legacy
+# single-underscore ``mcp_{server}_{tool}`` form was genuinely ambiguous when a
+# server name contained underscores (``mcp_a_b_tool`` = server ``a`` + tool
+# ``b_tool``, or server ``a_b`` + tool ``tool``); the ``__`` delimiter removes
+# that ambiguity. This map is still populated at registration time so parallel
+# safety never relies on prefix guessing, and so legacy names remain resolvable.
+#
+# The double-underscore form is not cosmetic: Anthropic's OAuth (subscription)
+# lane rejects any tool name matching ``^mcp_`` + non-underscore as a
+# third-party-app fingerprint, answering HTTP 400 "You're out of extra usage"
+# even when the plan has full quota. See ``_to_oauth_wire_name`` in
+# agent/anthropic_adapter.py (re-verified live 2026-07-19).
 _mcp_tool_server_names: Dict[str, str] = {}
 
 # Dedicated event loop running in a background daemon thread.

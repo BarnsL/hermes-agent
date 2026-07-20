@@ -12,7 +12,16 @@ logger = logging.getLogger(__name__)
 
 
 class AnthropicProfile(ProviderProfile):
-    """Native Anthropic — uses x-api-key header, not Bearer."""
+    """Native Anthropic — auth header depends on the credential shape.
+
+    CORRECTED 2026-07-19: previously documented as "uses x-api-key header, not
+    Bearer". That holds only for a Console API key (``sk-ant-api…``). A Claude
+    *subscription* OAuth token (``sk-ant-oat01-…``, CLAUDE_CODE_OAUTH_TOKEN)
+    must be sent as ``Authorization: Bearer``; sending it as x-api-key is a
+    live-verified 401 "invalid x-api-key". Both shapes hit the same
+    api.anthropic.com endpoints (GET /v1/models returns 200 for either, given
+    the matching header).
+    """
 
     def fetch_models(
         self,

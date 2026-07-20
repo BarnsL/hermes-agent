@@ -129,6 +129,12 @@ EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 # the ONLY anthropic credential for the full hour, so every turn silently
 # skipped Anthropic long after quota was back. 400 responses carry no
 # reset_at header, so the TTL is the only recovery path — keep it short.
+# ADDED 2026-07-19: that 400 is not always a real quota wall. A request whose
+# tool name matches ^mcp_ followed by a non-underscore (e.g. "mcp_foo") returns
+# the byte-identical "out of extra usage" 400 on a completely healthy plan
+# (mcp__foo, mcp___foo, mcpX_foo, my_mcp_foo and plain foo all return 200), so a
+# 400 can mean "malformed tool name" rather than "plan spent". That makes the
+# short TTL doubly correct: the credential may never have been exhausted at all.
 EXHAUSTED_TTL_400_SECONDS = 10 * 60          # 10 minutes
 
 # Throttle window for the "no available entries" INFO line. Credential

@@ -1846,20 +1846,39 @@ def _normalize_model_version(model: str) -> str:
 def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> Optional[int]:
     """Query Anthropic's /v1/models endpoint for context length.
 
-    Only works with regular ANTHROPIC_API_KEY (sk-ant-api*).
-    OAuth tokens (sk-ant-oat*) from Claude Code return 401.
+    Works with BOTH a console key (``sk-ant-api*``) and a Claude-subscription
+    OAuth token (``sk-ant-oat*``) — the auth header just has to match the
+    credential type.
+
+    Corrected 2026-07-19. This function used to bail out on ``sk-ant-oat*``
+    with the comment "OAuth tokens can't access /v1/models". That was a
+    misdiagnosis of its own bug: it sent EVERY credential as ``x-api-key``, and
+    an OAuth token in an ``x-api-key`` header is a 401 ("invalid x-api-key") no
+    matter which endpoint it hits. Verified live: the same token against
+    ``GET /v1/models`` with ``Authorization: Bearer`` returns HTTP 200 and the
+    full model list. The bail-out meant subscription users silently fell back to
+    the hardcoded DEFAULT_CONTEXT_LENGTHS table, so any model missing from that
+    table reported the generic 200K catch-all instead of its real window.
     """
-    if not api_key or api_key.startswith("sk-ant-oat"):
-        return None  # OAuth tokens can't access /v1/models
+    if not api_key:
+        return None
     try:
         base = base_url.rstrip("/")
         if base.endswith("/v1"):
             base = base[:-3]
         url = f"{base}/v1/models?limit=1000"
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        }
+        headers = {"anthropic-version": "2023-06-01"}
+        # Same detector the request adapter uses, so the header matches the
+        # credential shape rather than assuming a console key.
+        try:
+            from agent.anthropic_adapter import _is_oauth_token
+            _use_bearer = _is_oauth_token(api_key)
+        except Exception:
+            _use_bearer = api_key.startswith("sk-ant-oat")
+        if _use_bearer:
+            headers["authorization"] = f"Bearer {api_key}"
+        else:
+            headers["x-api-key"] = api_key
         resp = requests.get(url, headers=headers, timeout=(5, 10), verify=_resolve_requests_verify())
         if resp.status_code != 200:
             return None
@@ -2405,7 +2424,9 @@ def _get_model_context_length_uncapped(
                     return length
             return DEFAULT_FALLBACK_CONTEXT
 
-    # 4. Anthropic /v1/models API (only for regular API keys, not OAuth)
+    # 4. Anthropic /v1/models API — works for console keys AND subscription
+    #    OAuth tokens (the probe picks the matching auth header; see
+    #    _query_anthropic_context_length, corrected 2026-07-19).
     if provider == "anthropic" or (
         base_url and base_url_hostname(base_url) == "api.anthropic.com"
     ):

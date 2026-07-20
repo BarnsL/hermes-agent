@@ -1673,8 +1673,25 @@ def _maybe_wrap_anthropic(
         "(model=%s, base_url=%s, api_mode=%s)",
         model, base_url[:60] if base_url else "", api_mode or "auto-detected",
     )
+    # is_oauth must be DERIVED, not hardcoded. This chokepoint is reached for
+    # native Anthropic too — _endpoint_speaks_anthropic_messages() returns True
+    # for hostname == "api.anthropic.com" — via the `custom` provider, a
+    # task-level api_mode: anthropic_messages override, or MoA slot routing.
+    # build_anthropic_client() above already inspects the token itself and emits
+    # `Authorization: Bearer` for an OAuth one, so hardcoding False here made the
+    # FLAG disagree with the headers actually on the wire, and the flag is what
+    # gates the two OAuth-only request rewrites in build_anthropic_kwargs:
+    #   - the "You are Claude Code…" system prefix — omitting it makes Anthropic
+    #     reject the request with a bare HTTP 429 rate_limit_error (no
+    #     retry-after, no ratelimit headers), which reads as throttling and is
+    #     retried forever instead of being fixed;
+    #   - mcp__ tool-name normalization — see _to_oauth_wire_name.
+    # Third-party gateways are unaffected: their keys don't match the OAuth
+    # shapes, so this still evaluates False for them.
+    from agent.anthropic_adapter import _is_oauth_token
     return AnthropicAuxiliaryClient(
-        real_client, model, api_key, base_url, is_oauth=False,
+        real_client, model, api_key, base_url,
+        is_oauth=_is_oauth_token(api_key),
     )
 
 
@@ -2816,6 +2833,31 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         # healthy (it resolves the env token directly).
         entry = None
         token = explicit_api_key or resolve_anthropic_token()
+    if not token and not explicit_api_key:
+        # Selected entry exists but carries NO secret — retry the resolver.
+        #
+        # A pooled entry can be a pure POINTER: source="env:CLAUDE_CODE_OAUTH_TOKEN"
+        # with an empty access_token, re-hydrated from the environment on each
+        # load. Hydration reads dotenv + os.environ only
+        # (credential_pool._get_env_prefer_dotenv), and on Windows the Claude
+        # *subscription* token commonly lives ONLY in HKCU\Environment — not in
+        # ~/.hermes/.env and not in the gateway's inherited process env — so the
+        # pointer never fills in and _pool_runtime_api_key() returns "".
+        #
+        # Such an entry is still SELECTABLE: the unhydrated-entry guard in
+        # CredentialPool._available_entries is scoped to
+        # ``auth_type == AUTH_TYPE_API_KEY``, so an empty *oauth* entry passes
+        # through. That makes the branch above take the pooled path and shadow
+        # the resolver, turning a working credential into "not found".
+        #
+        # resolve_anthropic_token() recovers it via _windows_user_env_fallback()
+        # (a direct winreg read of HKCU\Environment). The MAIN agent calls that
+        # resolver unconditionally, which is why main sessions stayed healthy
+        # while every auxiliary side channel (vision, compression, titles, MoA)
+        # logged "anthropic requested but no Anthropic credentials found".
+        # Dropping the stale entry also restores the default base_url below.
+        entry = None
+        token = resolve_anthropic_token()
     if not token:
         return None, None
 

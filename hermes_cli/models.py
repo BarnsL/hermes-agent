@@ -318,6 +318,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "minimaxai/minimax-m3",
     ],
     "kimi-coding": [
+        # k3 pinned first per user preference (2026-07-19). The merge below is
+        # curated-first, so leading here = leading in the picker; the live
+        # fetch's own "k3" dedupes against this entry.
+        "k3",
         "kimi-k2.7-code",
         "kimi-k2.6",
         "kimi-k2.5",
@@ -329,6 +333,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2-0905-preview",
     ],
     "kimi-coding-cn": [
+        # k3 pinned first per user preference (2026-07-19). Not yet verified
+        # against the CN endpoint (no CN key on this box); the CN live fetch
+        # will surface reality if Moonshot CN does not serve k3.
+        "k3",
         "kimi-k2.6",
         "kimi-k2.5",
         "kimi-k2-thinking",
@@ -365,7 +373,11 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2.1",
         "MiniMax-M2",
     ],
+    # 2026-07-19: reconciled against a live GET /v1/models. Dropped
+    # claude-opus-4-20250514 and claude-sonnet-4-20250514 — the API no longer
+    # lists them. Added claude-sonnet-5.
     "anthropic": [
+        "claude-sonnet-5",
         "claude-fable-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
@@ -373,8 +385,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-sonnet-4-6",
         "claude-opus-4-5-20251101",
         "claude-sonnet-4-5-20250929",
-        "claude-opus-4-20250514",
-        "claude-sonnet-4-20250514",
         "claude-haiku-4-5-20251001",
     ],
     "deepseek": [

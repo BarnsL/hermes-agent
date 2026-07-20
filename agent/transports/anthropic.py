@@ -136,13 +136,23 @@ class AnthropicTransport(ProviderTransport):
                     # ``mcp__`` prefix (added in build_anthropic_kwargs to avoid
                     # Anthropic's single-underscore third-party classifier).
                     # Reverse it back to the name the registry/dispatcher knows.
-                    # Two original forms map onto the same ``mcp__`` wire name:
-                    #   ``mcp__read_file``       <- bare native tool ``read_file``
-                    #   ``mcp__linear_get_issue`` <- MCP server tool
-                    #                                ``mcp_linear_get_issue``
                     # Resolve by registry lookup, preferring whichever original
                     # is actually registered; never rewrite a name the LLM used
                     # that already resolves natively. GH-25255.
+                    #
+                    # Forms that can map onto the same ``mcp__`` wire name:
+                    #   ``mcp__read_file``        <- bare native tool ``read_file``
+                    #   ``mcp__linear__get_issue`` <- MCP server tool, registered
+                    #                                 in this exact form today
+                    #   ``mcp__linear_get_issue``  <- LEGACY single-underscore
+                    #                                 registration
+                    #                                 (``mcp_linear_get_issue``)
+                    # NOTE (2026-07-19): registration now emits
+                    # ``mcp__<server>__<tool>`` directly (mcp_prefixed_tool_name
+                    # in tools/mcp_tool.py), so the FIRST lookup below normally
+                    # hits and the ``single`` candidate is a legacy-compat path,
+                    # not the common case. Keep it: it costs one dict miss and
+                    # still rescues pre-migration names.
                     from tools.registry import registry as _tool_registry
                     if not _tool_registry.get_entry(name):
                         bare = name[len(_MCP_PREFIX):]            # read_file
