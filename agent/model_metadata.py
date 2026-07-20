@@ -2102,7 +2102,28 @@ _SUBSCRIPTION_PLAN_CONTEXT_CAP = 200_000
 def _apply_subscription_context_cap(
     resolved: int, provider: str, api_key: str
 ) -> int:
-    """Clamp OAuth-subscription Anthropic context to the plan-lane boundary."""
+    """Clamp OAuth-subscription Anthropic context to the plan-lane boundary.
+
+    TRADEOFF (read before "fixing" a model that shows 200K): the underlying
+    models really do advertise a 1M window, and this function is what makes the
+    picker/footer report 200K instead. That is deliberate, not a stale table.
+
+      - Capped (default): every request stays under the 200K plan-lane
+        boundary, so usage draws on the self-refilling subscription allowance.
+        The cost is that long sessions compress/summarize sooner than they
+        would at 1M.
+      - Uncapped (`anthropic.long_context: true` in config.yaml): the full 1M
+        window is advertised, and any request whose input exceeds 200K bills to
+        the EXTRA-USAGE budget, which does NOT refill. Exhausting it returns
+        HTTP 400 "out of extra usage" for every subsequent call — including
+        small ones — until more usage is purchased.
+
+    So this is a billing-safety default, chosen because the failure mode of the
+    uncapped path is a hard account-wide stall rather than a slow request. Users
+    who deliberately fund extra usage opt in via the config flag above; the flag
+    is honoured below and is the supported way to get 1M. Metered API keys
+    (x-api-key) are never capped — they have no extra-usage lane to exhaust.
+    """
     if resolved <= _SUBSCRIPTION_PLAN_CONTEXT_CAP:
         return resolved
     if (provider or "").strip().lower() not in {"anthropic", "claude", "claude-code"}:

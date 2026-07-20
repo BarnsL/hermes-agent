@@ -1515,6 +1515,35 @@ def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False)
     return raw_pool_present
 
 
+def _has_resolvable_provider_token(provider: str) -> bool:
+    """Return whether *provider* has a token reachable outside ``os.environ``.
+
+    The provider-listing credential gates below test ``os.environ`` plus
+    ``auth.json``. That misses the Anthropic subscription token, which Claude
+    Code persists as a Windows USER environment variable (``HKCU\\Environment``):
+    a process only inherits it when every ancestor of its launch chain did, so
+    a backend spawned from a stripped/curated environment sees none of
+    ANTHROPIC_API_KEY / ANTHROPIC_TOKEN / CLAUDE_CODE_OAUTH_TOKEN while the
+    durable token is perfectly valid. The provider row was then dropped before
+    any model list was built, and the picker showed no Anthropic models at all.
+
+    ``resolve_anthropic_token()`` already implements the full documented
+    resolution order (env -> HKCU registry -> Claude Code credential file ->
+    credential pool), so delegate rather than duplicating those reads here.
+    Imported lazily and defensively: a broken adapter must never take down the
+    whole provider picker.
+    """
+    if (provider or "").strip().lower() not in {"anthropic", "claude", "claude-code"}:
+        return False
+    try:
+        from agent.anthropic_adapter import resolve_anthropic_token
+
+        return bool(resolve_anthropic_token())
+    except Exception:
+        logger.debug("Anthropic token resolution failed for listing", exc_info=True)
+        return False
+
+
 def _extra_headers_from_config(entry: Any) -> dict[str, str]:
     if not isinstance(entry, dict):
         return {}
@@ -1818,8 +1847,12 @@ def list_authenticated_providers(
             if not isinstance(env_vars, list):
                 continue
 
-        # Check if any env var is set
+        # Check if any env var is set. Cheap env test first, then the
+        # out-of-environ resolver (HKCU registry / credential files) so the
+        # common path stays allocation-free.
         has_creds = any(os.environ.get(ev) for ev in env_vars)
+        if not has_creds:
+            has_creds = _has_resolvable_provider_token(hermes_id)
         if not has_creds:
             try:
                 from hermes_cli.auth import _load_auth_store
@@ -1909,6 +1942,13 @@ def list_authenticated_providers(
                     if any(os.environ.get(ev) for ev in pcfg.api_key_env_vars):
                         has_creds = True
                         break
+            # Same out-of-environ fallback as section 1, so this path also
+            # recovers if section 1's ordering ever changes.
+            if not has_creds:
+                for _key in (pid, hermes_slug):
+                    if _has_resolvable_provider_token(_key):
+                        has_creds = True
+                        break
         # Check auth store and credential pool for non-env-var credentials.
         # This applies to OAuth providers AND api_key providers that also
         # support OAuth (e.g. anthropic supports both API key and Claude Code
@@ -1922,10 +1962,14 @@ def list_authenticated_providers(
                     has_creds = True
             except Exception as exc:
                 logger.debug("Auth store check failed for %s: %s", pid, exc)
-        # Fallback: check the credential pool with full auto-seeding.
-        # This catches credentials that exist in external stores (e.g.
-        # Codex CLI ~/.codex/auth.json) which _seed_from_singletons()
-        # imports on demand but aren't in the raw auth.json yet.
+        # Fallback: check the credential pool.
+        # This catches credentials already persisted to the pool that are not
+        # visible via the env vars or the auth-store providers map.
+        # NOTE: there is no on-demand seeding helper behind this check — an
+        # external store (e.g. Codex CLI ~/.codex/auth.json) is only seen here
+        # once something has written it into the pool. Provider-specific
+        # out-of-environ resolution belongs in
+        # ``_has_resolvable_provider_token`` above.
         if not has_creds:
             try:
                 if _credential_pool_is_usable(hermes_slug):

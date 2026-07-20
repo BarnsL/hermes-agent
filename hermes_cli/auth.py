@@ -565,6 +565,36 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     return True
 
 
+def _user_env_registry_secret(name: str) -> bool:
+    """Return True when *name* holds a usable secret under HKCU\\Environment.
+
+    Windows persists USER environment variables in the registry; a process only
+    inherits one if every ancestor of its launch chain did. Reading the registry
+    directly distinguishes a durable user-configured value from a variable that
+    merely happens to be present in this process's environment. Returns False on
+    non-Windows platforms and on any registry error.
+    """
+    if sys.platform != "win32":
+        return False
+    # Unit tests pin resolution behaviour by monkeypatching os.environ, but they
+    # cannot sandbox HKCU — on a developer machine holding a real token this
+    # would hijack those assertions. Production runs never set this variable.
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            try:
+                value, _kind = winreg.QueryValueEx(key, name)
+            except OSError:
+                return False
+            return has_usable_secret(str(value or ""))
+    except Exception:
+        logger.debug("HKCU Environment lookup failed for %s", name, exc_info=True)
+        return False
+
+
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
@@ -1614,6 +1644,17 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     if pconfig and pconfig.auth_type == "api_key":
         for env_var in pconfig.api_key_env_vars:
             if env_var in _IMPLICIT_ENV_VARS:
+                # A CLAUDE_CODE_OAUTH_TOKEN merely *inherited* in this process's
+                # environment is ambient (a live Claude Code parent) and stays
+                # excluded. The same name persisted under HKCU\Environment is
+                # different: that is durable machine state the user set up via
+                # the setup-token flow, so it counts as explicit configuration.
+                # Without this, a valid subscription token still gets the
+                # Anthropic row filtered out of every explicit_only surface
+                # (the desktop chat model picker) even after the provider
+                # listing gate accepts it.
+                if _user_env_registry_secret(env_var):
+                    return True
                 continue
             if has_usable_secret(os.getenv(env_var, "")):
                 return True
