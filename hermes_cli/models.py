@@ -408,6 +408,11 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "trinity-large-preview",
         "trinity-mini",
     ],
+    "sakana": [
+        "fugu-ultra",
+        "fugu",
+        "fugu-ultra-20260615",
+    ],
     "gmi": [
         "zai-org/GLM-5.1-FP8",
         "deepseek-ai/DeepSeek-V3.2",
@@ -1090,6 +1095,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("minimax-cn",     "MiniMax (China)",          "MiniMax China (Domestic direct API)"),
     ProviderEntry("ollama-cloud",   "Ollama Cloud",             "Ollama Cloud (Cloud-hosted open models, ollama.com)"),
     ProviderEntry("arcee",          "Arcee AI",                 "Arcee AI (Trinity models, direct API)"),
+    ProviderEntry("sakana",         "Sakana AI",                "Sakana AI (Fugu multi-agent orchestration, direct API)"),
     ProviderEntry("gmi",            "GMI Cloud",                "GMI Cloud (Multi-model direct API)"),
     ProviderEntry("kilocode",       "Kilo Code",                "Kilo Code (Kilo Gateway API)"),
     ProviderEntry("opencode-zen",   "OpenCode Zen",             "OpenCode Zen (Curated models, pay-as-you-go)"),
@@ -1252,6 +1258,8 @@ _PROVIDER_ALIASES = {
     "stepfun-coding-plan": "stepfun",
     "arcee-ai": "arcee",
     "arceeai": "arcee",
+    "sakana-ai": "sakana",
+    "sakanaai": "sakana",
     "gmi-cloud": "gmi",
     "gmicloud": "gmi",
     "fireworks-ai": "fireworks",
@@ -2364,6 +2372,7 @@ def _resolve_copilot_catalog_api_key() -> str:
 # stepfun, openai-codex) — those paths handle freshness themselves.
 _MODELS_DEV_PREFERRED: frozenset[str] = frozenset({
     "opencode-go",
+    "sakana",
     "opencode-zen",
     "deepseek",
     "kilocode",

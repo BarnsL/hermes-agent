@@ -219,6 +219,13 @@ export const PROVIDER_GROUPS: ProviderPrefix[] = [
     description: 'Authenticate via AWS profile + region',
     docsUrl: 'https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-regions.html',
     priority: 23
+  },
+  {
+    prefix: 'SAKANA_',
+    name: 'Sakana AI',
+    description: 'Fugu multi-agent orchestration (1M context)',
+    docsUrl: 'https://console.sakana.ai',
+    priority: 24
   }
 ]
 

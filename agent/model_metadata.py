@@ -52,6 +52,7 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "qwen-oauth",
     "xiaomi",
     "arcee",
+    "sakana",
     "gmi",
     "tencent-tokenhub",
     "custom", "local",
@@ -64,6 +65,7 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "mimo", "xiaomi-mimo",
     "tencent", "tokenhub", "tencent-cloud", "tencentmaas",
     "arcee-ai", "arceeai",
+    "sakana-ai", "sakanaai",
     "gmi-cloud", "gmicloud",
     "xai", "x-ai", "x.ai", "grok",
     "nvidia", "nim", "nvidia-nim", "nemotron",
@@ -338,6 +340,9 @@ DEFAULT_CONTEXT_LENGTHS = {
     "nemotron": 131072,
     # Arcee
     "trinity": 262144,
+    # Sakana AI — Fugu orchestration family (1M context across fugu,
+    # fugu-ultra and dated snapshots).
+    "fugu": 1_000_000,
     # OpenRouter
     "elephant": 262144,
     # Hugging Face Inference Providers — model IDs use org/name format
@@ -463,6 +468,7 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "api.stepfun.ai": "stepfun",
     "api.stepfun.com": "stepfun",
     "api.arcee.ai": "arcee",
+    "api.sakana.ai": "sakana",
     "api.minimax": "minimax",
     "dashscope.aliyuncs.com": "alibaba",
     "dashscope-intl.aliyuncs.com": "alibaba",
