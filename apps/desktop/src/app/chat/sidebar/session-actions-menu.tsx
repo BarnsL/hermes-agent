@@ -149,7 +149,9 @@ interface MenuKit {
   SubContent: typeof DropdownMenuSubContent | typeof ContextMenuSubContent
 }
 
-const DROPDOWN_KIT: MenuKit = {
+/** Exported for tests — mounting SessionCategoryItems needs a kit. The
+ *  context flavour is covered end-to-end through SessionContextMenu instead. */
+export const DROPDOWN_KIT: MenuKit = {
   Item: DropdownMenuItem,
   Separator: DropdownMenuSeparator,
   Sub: DropdownMenuSub,
@@ -229,8 +231,21 @@ export function createCategoryForSession(durableId: string, name: string): Sessi
 // submenu subscribes to the stores — the menu is rendered per sidebar row AND
 // twice per row (context menu + dropdown), so subscribing in useSessionActions
 // would re-render every visible row's menus on any category edit. Same
-// rationale as SessionColorSwatches above.
-function SessionCategoryItems({ kit, sessionId }: { kit: MenuKit; sessionId: string }) {
+// rationale as SessionColorSwatches above. Exported for tests — mounting it
+// inside an open menu is what pins the live→durable id resolution and the
+// checked/empty/remove states that the pure helpers below cannot cover.
+export function SessionCategoryItems({
+  kit,
+  sessionId,
+  suppressCloseAutoFocusRef
+}: {
+  kit: MenuKit
+  sessionId: string
+  /** Set to true when an item hands focus to another surface, so the menu's
+   *  onCloseAutoFocus suppresses Radix's focus restore for that ONE close.
+   *  See "New category…" below. */
+  suppressCloseAutoFocusRef: React.RefObject<boolean>
+}) {
   const { t } = useI18n()
   const c = t.sidebar.categories
   const categories = useStore($sessionCategories)
@@ -287,11 +302,16 @@ function SessionCategoryItems({ kit, sessionId }: { kit: MenuKit; sessionId: str
           // input rather than opening a second naming UI — same end state as
           // the Categories "+" button.
           //
-          // Deferred by a tick because Radix returns focus to the menu trigger
-          // as the menu closes: mounting the autoFocus rename input in this
-          // same commit would let that focus return blur it immediately, which
-          // commits the rename and makes the input flash and vanish.
-          window.setTimeout(() => setEditingCategoryId(category.id), 0)
+          // Radix restores focus to the trigger as the menu closes, which would
+          // blur the freshly mounted autoFocus rename input, commit the rename,
+          // and make the input flash and vanish — leaving a category stuck at
+          // the literal default name. SUPPRESS that restore rather than racing
+          // it with a setTimeout: the restore runs from FocusScope's unmount
+          // cleanup, whose timing depends on the content's exit ANIMATION
+          // (Radix Presence defers unmount until animationend), so no fixed
+          // deferral wins reliably. Same idiom as projects/project-menu.tsx.
+          suppressCloseAutoFocusRef.current = true
+          setEditingCategoryId(category.id)
         }}
       >
         <Codicon name="new-folder" size="0.875rem" />
@@ -333,6 +353,27 @@ function useSessionActions({
   const [renameOpen, setRenameOpen] = useState(false)
   const tiles = useStore($sessionTiles)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  // Armed by menu items that move focus elsewhere on close (currently only
+  // "Move to category" → "New category…", which mounts the sidebar's autoFocus
+  // rename input). Consumed — and disarmed — by onCloseAutoFocus below, so the
+  // suppression covers exactly one close and ordinary keyboard focus-return to
+  // the trigger keeps working for every other item.
+  const suppressCloseAutoFocusRef = useRef(false)
+
+  // Radix's focus restore lives in FocusScope's unmount cleanup for the ROOT
+  // content (submenu content already self-suppresses — @radix-ui/react-menu
+  // passes onCloseAutoFocus: event => event.preventDefault()). preventDefault
+  // here stops BOTH flavours: react-dropdown-menu composes our handler ahead of
+  // its own triggerRef.focus() with checkForDefaultPrevented, and
+  // react-context-menu calls ours first, then honours event.defaultPrevented.
+  const onCloseAutoFocus = (event: Event) => {
+    if (!suppressCloseAutoFocusRef.current) {
+      return
+    }
+
+    suppressCloseAutoFocusRef.current = false
+    event.preventDefault()
+  }
 
   // Already showing as a tab somewhere (a tile, or loaded in main — main IS
   // a tab): offering "Open in new tab" again is noise.
@@ -513,7 +554,7 @@ function useSessionActions({
           <span>{t.sidebar.categories.moveTo}</span>
         </kit.SubTrigger>
         <kit.SubContent className="w-52">
-          <SessionCategoryItems kit={kit} sessionId={sessionId} />
+          <SessionCategoryItems kit={kit} sessionId={sessionId} suppressCloseAutoFocusRef={suppressCloseAutoFocusRef} />
         </kit.SubContent>
       </kit.Sub>
       <kit.Sub>
@@ -572,7 +613,7 @@ function useSessionActions({
     />
   )
 
-  return { renameDialog, renderItems }
+  return { onCloseAutoFocus, renameDialog, renderItems }
 }
 
 interface SessionActionsMenuProps
@@ -582,7 +623,7 @@ interface SessionActionsMenuProps
 
 export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ...actions }: SessionActionsMenuProps) {
   const { t } = useI18n()
-  const { renameDialog, renderItems } = useSessionActions(actions)
+  const { onCloseAutoFocus, renameDialog, renderItems } = useSessionActions(actions)
   const [open, setOpen] = useState(false)
 
   return (
@@ -593,6 +634,7 @@ export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ..
           align={align}
           aria-label={t.sidebar.row.actionsFor(actions.title)}
           className="w-40"
+          onCloseAutoFocus={onCloseAutoFocus}
           sideOffset={sideOffset}
         >
           {renderItems(DROPDOWN_KIT)}
@@ -609,13 +651,17 @@ interface SessionContextMenuProps extends SessionActions {
 
 export function SessionContextMenu({ children, ...actions }: SessionContextMenuProps) {
   const { t } = useI18n()
-  const { renameDialog, renderItems } = useSessionActions(actions)
+  const { onCloseAutoFocus, renameDialog, renderItems } = useSessionActions(actions)
 
   return (
     <>
       <ContextMenu>
         <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-        <ContextMenuContent aria-label={t.sidebar.row.actionsFor(actions.title)} className="w-40">
+        <ContextMenuContent
+          aria-label={t.sidebar.row.actionsFor(actions.title)}
+          className="w-40"
+          onCloseAutoFocus={onCloseAutoFocus}
+        >
           {renderItems(CONTEXT_KIT)}
         </ContextMenuContent>
       </ContextMenu>
