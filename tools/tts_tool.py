@@ -273,6 +273,36 @@ FALLBACK_MAX_TEXT_LENGTH = 4000
 # Back-compat alias. Prefer ``_resolve_max_text_length()`` for new code.
 MAX_TEXT_LENGTH = FALLBACK_MAX_TEXT_LENGTH
 
+# Sentence enders used when trimming over-long text back to a clean edge.
+_SENTENCE_ENDERS = ".!?…"
+
+
+def _trim_to_boundary(text: str, max_len: int) -> str:
+    """Trim *text* to at most *max_len* chars, ending on a clean boundary.
+
+    WHY (2026-07-19 voice report): the caller used a bare ``text[:max_len]``
+    slice, which cut mid-word — the user heard replies stop on a partial
+    syllable. Prefer the last sentence ender inside the budget, else the
+    last space, so the cap degrades into a shorter *complete* utterance
+    instead of a broken one. Only accept a boundary in the last 40% of the
+    budget; a sentence ender near the start would throw away most of the
+    reply, in which case a word-boundary cut is the better trade.
+
+    Falls back to the hard slice when the text has no usable boundary at
+    all (e.g. one long unbroken token), so the cap is always enforced.
+    """
+    if max_len <= 0 or len(text) <= max_len:
+        return text
+    window = text[:max_len]
+    floor = int(max_len * 0.6)
+    best = max(window.rfind(c) for c in _SENTENCE_ENDERS)
+    if best >= floor:
+        return window[:best + 1].rstrip()
+    cut = window.rfind(" ")
+    if cut >= floor:
+        return window[:cut].rstrip()
+    return window
+
 
 def _resolve_max_text_length(
     provider: Optional[str],
@@ -1832,11 +1862,15 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     )
     max_len = _resolve_max_text_length("gemini", tts_config)
     if len(prompt_text) > max_len:
+        # Boundary-aware trim (2026-07-19 voice report) — same rationale
+        # as the main synth path: never cut mid-word.
+        original_len = len(prompt_text)
+        prompt_text = _trim_to_boundary(prompt_text, max_len)
         logger.warning(
-            "Gemini TTS composed prompt too long (%d chars), truncating to %d",
-            len(prompt_text), max_len,
+            "Gemini TTS composed prompt too long (%d chars), trimmed to %d "
+            "at a sentence/word boundary (cap %d)",
+            original_len, len(prompt_text), max_len,
         )
-        prompt_text = prompt_text[:max_len]
 
     payload: Dict[str, Any] = {
         "contents": [{"parts": [{"text": prompt_text}]}],
@@ -2318,11 +2352,15 @@ def text_to_speech_tool(
     # (OpenAI 4096, xAI 15k, MiniMax 10k, ElevenLabs model-aware, etc.).
     max_len = _resolve_max_text_length(provider, tts_config)
     if len(text) > max_len:
+        # Boundary-aware, not a bare slice (2026-07-19 voice report:
+        # replies were being cut mid-word). See _trim_to_boundary.
+        original_len = len(text)
+        text = _trim_to_boundary(text, max_len)
         logger.warning(
-            "TTS text too long for provider %s (%d chars), truncating to %d",
-            provider, len(text), max_len,
+            "TTS text too long for provider %s (%d chars), trimmed to %d "
+            "at a sentence/word boundary (cap %d)",
+            provider, original_len, len(text), max_len,
         )
-        text = text[:max_len]
 
     # Detect platform from gateway env var to choose the best output format.
     # Telegram voice bubbles require Opus (.ogg); OpenAI and ElevenLabs can
