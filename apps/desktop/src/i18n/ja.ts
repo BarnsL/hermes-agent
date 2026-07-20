@@ -1539,7 +1539,11 @@ export const ja = defineLocale({
       menu: 'カテゴリ操作',
       rename: '名前を変更',
       delete: '削除',
-      dropHint: 'ここにセッションをドロップ'
+      dropHint: 'ここにセッションをドロップ',
+      moveTo: 'カテゴリへ移動',
+      moveToNew: '新しいカテゴリ…',
+      moveToEmpty: 'カテゴリがありません',
+      removeFrom: 'カテゴリから外す'
     },
     sessions: 'セッション',
     cronJobs: 'Cronジョブ',

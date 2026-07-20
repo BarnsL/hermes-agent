@@ -47,6 +47,14 @@ import { triggerHaptic } from '@/lib/haptics'
 import { PROFILE_SWATCHES } from '@/lib/profile-color'
 import { exportSession } from '@/lib/session-export'
 import { activeGateway } from '@/store/gateway'
+import {
+  $sessionCategories,
+  createCategory,
+  moveSessionToCategory,
+  removeSessionFromCategory,
+  type SessionCategory,
+  setEditingCategoryId
+} from '@/store/layout'
 import { notify, notifyError } from '@/store/notifications'
 import {
   $activeSessionId,
@@ -184,6 +192,125 @@ function SessionColorSwatches({ sessionId }: { sessionId: string }) {
       swatches={PROFILE_SWATCHES}
       value={overrides[durableId] ?? null}
     />
+  )
+}
+
+// Last-resort category name. Every shipped locale defines
+// sidebar.categories.defaultName, so this only guards a locale regressing to a
+// blank string — the store's sanitizer accepts an empty name (it only checks
+// `typeof name === 'string'`), which would persist an unnameable, unlabelled
+// category the user cannot tell apart from its siblings.
+const FALLBACK_CATEGORY_NAME = 'New category'
+
+// The category a session currently lives in, or undefined when it is
+// uncategorized. `find` is exhaustive because membership is exactly ONE
+// category: moveSessionToCategory strips the id from every other category in
+// the same write. Takes the DURABLE session id. Exported for tests.
+export function categoryForSession(categories: SessionCategory[], durableId: string): SessionCategory | undefined {
+  return categories.find(category => category.sessionIds.includes(durableId))
+}
+
+// Create a category and file the session into it in one gesture, returning the
+// new category so the caller can put it straight into rename mode.
+//
+// The order is load-bearing: createCategory commits synchronously (nanostores
+// `.set`), so moveSessionToCategory's "does the target exist?" guard sees the
+// category that was just minted. `name` is the localized default — trimmed and
+// backstopped so a category can never be created blank. Exported for tests.
+export function createCategoryForSession(durableId: string, name: string): SessionCategory {
+  const category = createCategory(name.trim() || FALLBACK_CATEGORY_NAME)
+
+  moveSessionToCategory(durableId, category.id)
+
+  return category
+}
+
+// The "Move to category" submenu body. Its own component so only an OPEN
+// submenu subscribes to the stores — the menu is rendered per sidebar row AND
+// twice per row (context menu + dropdown), so subscribing in useSessionActions
+// would re-render every visible row's menus on any category edit. Same
+// rationale as SessionColorSwatches above.
+function SessionCategoryItems({ kit, sessionId }: { kit: MenuKit; sessionId: string }) {
+  const { t } = useI18n()
+  const c = t.sidebar.categories
+  const categories = useStore($sessionCategories)
+  const session = useStore($sessions).find(s => sessionMatchesStoredId(s, sessionId))
+  // Membership is keyed on the DURABLE id (the lineage root), like pins:
+  // filing the LIVE id would evaporate at the next auto-compression. Same
+  // resolution the drop handler does in session-categories-section.tsx.
+  const durableId = session ? sessionPinId(session) : sessionId
+  const current = categoryForSession(categories, durableId)
+
+  return (
+    <>
+      {categories.length === 0 ? (
+        // A plain div rather than a disabled Item: Radix's roving focus skips
+        // disabled items, so keyboard focus lands straight on "New category…"
+        // instead of stalling on an inert empty-state row.
+        <div className="px-2 py-1 text-xs text-(--ui-text-tertiary)">{c.moveToEmpty}</div>
+      ) : (
+        categories.map(category => (
+          <kit.Item
+            // ContextMenu has no CheckboxItem/RadioItem primitive (DropdownMenu
+            // does), and ONE definition serves both flavours — so the checked
+            // state is announced by hand and drawn with the same check Codicon
+            // DropdownMenuCheckboxItem renders internally.
+            aria-checked={category.id === current?.id}
+            key={category.id}
+            onSelect={() => {
+              triggerHaptic('selection')
+
+              // Re-selecting the current category would only shuffle the
+              // session to the tail of that category's membership.
+              if (category.id === current?.id) {
+                return
+              }
+
+              moveSessionToCategory(durableId, category.id)
+            }}
+            role="menuitemradio"
+          >
+            <Codicon name="folder" size="0.875rem" />
+            <span className="min-w-0 flex-1 truncate">{category.name}</span>
+            {category.id === current?.id && <Codicon className="ml-auto" name="check" size="0.75rem" />}
+          </kit.Item>
+        ))
+      )}
+      <kit.Separator />
+      <kit.Item
+        onSelect={() => {
+          triggerHaptic('selection')
+
+          const category = createCategoryForSession(durableId, c.defaultName)
+
+          // Hand the fresh category to the sidebar's EXISTING inline-rename
+          // input rather than opening a second naming UI — same end state as
+          // the Categories "+" button.
+          //
+          // Deferred by a tick because Radix returns focus to the menu trigger
+          // as the menu closes: mounting the autoFocus rename input in this
+          // same commit would let that focus return blur it immediately, which
+          // commits the rename and makes the input flash and vanish.
+          window.setTimeout(() => setEditingCategoryId(category.id), 0)
+        }}
+      >
+        <Codicon name="new-folder" size="0.875rem" />
+        <span>{c.moveToNew}</span>
+      </kit.Item>
+      {current && (
+        // Not destructive: the category and the session both survive, only the
+        // membership goes — so no red, unlike the category header's Delete.
+        <kit.Item
+          onSelect={() => {
+            triggerHaptic('selection')
+            removeSessionFromCategory(durableId, current.id)
+          }}
+        >
+          <Codicon name="circle-slash" size="0.875rem" />
+          <span>{c.removeFrom}</span>
+        </kit.Item>
+      )}
+    </>
   )
 }
 
@@ -379,6 +506,16 @@ function useSessionActions({
       {openItems.map(item => renderMenuItem(kit.Item, item))}
       {openItems.length > 0 && <kit.Separator />}
       {identityItems.map(item => renderMenuItem(kit.Item, item))}
+      {/* Filing verbs sit together: pin (identityItems, above) and category. */}
+      <kit.Sub>
+        <kit.SubTrigger disabled={!sessionId}>
+          <Codicon name="folder" size="0.875rem" />
+          <span>{t.sidebar.categories.moveTo}</span>
+        </kit.SubTrigger>
+        <kit.SubContent className="w-52">
+          <SessionCategoryItems kit={kit} sessionId={sessionId} />
+        </kit.SubContent>
+      </kit.Sub>
       <kit.Sub>
         <kit.SubTrigger disabled={!sessionId}>
           <Codicon name="symbol-color" size="0.875rem" />

@@ -1610,7 +1610,11 @@ export const en: Translations = {
       menu: 'Category actions',
       rename: 'Rename',
       delete: 'Delete',
-      dropHint: 'Drop sessions here'
+      dropHint: 'Drop sessions here',
+      moveTo: 'Move to category',
+      moveToNew: 'New category…',
+      moveToEmpty: 'No categories yet',
+      removeFrom: 'Remove from category'
     },
     sessions: 'Sessions',
     cronJobs: 'Cron jobs',

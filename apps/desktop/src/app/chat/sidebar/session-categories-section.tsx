@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import type * as React from 'react'
 
 import { Button } from '@/components/ui/button'
@@ -67,7 +67,13 @@ export function SessionCategoriesSection({
         <Button
           aria-label={c.newCategory}
           className="h-5 w-5"
-          onClick={() => createCategory(c.defaultName)}
+          // Create AND name in one gesture: land the fresh category in the
+          // inline-rename input instead of leaving a row called "New category"
+          // for the user to hunt down and rename. Matches the session actions
+          // menu's "New category…". No deferral needed here (unlike that menu):
+          // a plain Button does not restore focus on click, so nothing competes
+          // with the input's autoFocus.
+          onClick={() => setEditingCategoryId(createCategory(c.defaultName).id)}
           size="icon"
           variant="ghost"
         >
@@ -142,9 +148,26 @@ function CategorySection({
     .map(id => sessionById.get(id))
     .filter((session): session is SessionInfo => Boolean(session))
 
+  // Rename mode can be entered from OUTSIDE this component — the session
+  // actions menu's "New category…" creates a category and hands it straight to
+  // this input — so seeding lives here rather than only in beginRename.
+  //
+  // Re-arming committedRef matters as much as the text: it is left true by any
+  // previous commit on this instance, which would make the next external
+  // rename silently no-op. useLayoutEffect (not useEffect) so the input never
+  // paints a frame with stale/empty text.
+  useLayoutEffect(() => {
+    if (editing) {
+      committedRef.current = false
+      setEditName(category.name)
+    }
+    // Deliberately keyed on `editing` alone: re-seeding on every name change
+    // would clobber what the user is typing, since commitRename writes the
+    // name while this input is still mounted.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editing])
+
   const beginRename = () => {
-    committedRef.current = false
-    setEditName(category.name)
     setEditingCategoryId(category.id)
   }
 

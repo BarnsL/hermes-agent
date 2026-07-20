@@ -1490,7 +1490,11 @@ export const zhHant = defineLocale({
       menu: '分類操作',
       rename: '重新命名',
       delete: '刪除',
-      dropHint: '將工作階段拖放到此處'
+      dropHint: '將工作階段拖放到此處',
+      moveTo: '移動到分類',
+      moveToNew: '新增分類…',
+      moveToEmpty: '尚無分類',
+      removeFrom: '移出分類'
     },
     sessions: '工作階段',
     cronJobs: '排程任務',

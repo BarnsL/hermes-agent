@@ -1336,6 +1336,10 @@ export interface Translations {
       rename: string
       delete: string
       dropHint: string
+      moveTo: string
+      moveToNew: string
+      moveToEmpty: string
+      removeFrom: string
     }
     sessions: string
     cronJobs: string

@@ -1793,7 +1793,11 @@ export const zh: Translations = {
       menu: '分类操作',
       rename: '重命名',
       delete: '删除',
-      dropHint: '将会话拖放到此处'
+      dropHint: '将会话拖放到此处',
+      moveTo: '移动到分类',
+      moveToNew: '新建分类…',
+      moveToEmpty: '暂无分类',
+      removeFrom: '移出分类'
     },
     sessions: '会话',
     cronJobs: '定时任务',
