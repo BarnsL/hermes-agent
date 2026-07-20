@@ -668,14 +668,17 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "tts.provider": {
         "type": "select",
         "description": "Text-to-speech provider",
-        "options": ["edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts", "piper"],
+        # CV-011: "conversoar" first — the managed config pins it; keeping it in
+        # the schema stops the Settings dropdown from drifting off the bridge.
+        "options": ["conversoar", "edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts", "piper"],
     },
     "stt.provider": {
         "type": "select",
         "description": "Speech-to-text provider",
         # "mistral" temporarily removed — mistralai PyPI package quarantined
         # (malicious 2.4.6 release on 2026-05-12). Restore once available.
-        "options": ["local", "groq", "openai", "xai", "elevenlabs"],
+        # CV-011: "conversoar" first — see tts.provider above.
+        "options": ["conversoar", "local", "groq", "openai", "xai", "elevenlabs"],
     },
     "stt.elevenlabs.model_id": {
         "type": "select",
