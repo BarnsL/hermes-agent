@@ -3015,19 +3015,42 @@ def run_conversation(
                     _retry.thinking_sig_retry_attempted = True
                     _api_stripped = 0
                     for _m in api_messages:
-                        if isinstance(_m, dict) and "reasoning_details" in _m:
-                            _m.pop("reasoning_details", None)
-                            _api_stripped += 1
+                        if isinstance(_m, dict):
+                            # Strip Hermes-style reasoning_details
+                            if "reasoning_details" in _m:
+                                _m.pop("reasoning_details", None)
+                                _api_stripped += 1
+                            # Strip ordered Anthropic blocks (interleaved
+                            # thinking + tool_use) which still carry signed
+                            # thinking blocks.
+                            if "anthropic_content_blocks" in _m:
+                                _m.pop("anthropic_content_blocks", None)
+                                _api_stripped += 1
+                            # Strip any stray thinking/redacted_thinking blocks
+                            # already present in a content list.
+                            _content = _m.get("content")
+                            if isinstance(_content, list):
+                                _filtered = []
+                                for _block in _content:
+                                    if isinstance(_block, dict) and _block.get("type") in (
+                                        "thinking",
+                                        "redacted_thinking",
+                                    ):
+                                        _api_stripped += 1
+                                        continue
+                                    _filtered.append(_block)
+                                _m["content"] = _filtered
                     agent._vprint(
                         f"{agent.log_prefix}⚠️  Thinking block signature invalid, "
-                        f"stripped reasoning_details from api_messages for retry...",
+                        f"stripped all reasoning/thinking blocks from api_messages for retry...",
                         force=True,
                     )
                     logger.warning(
                         "%sThinking block signature recovery: stripped "
-                        "reasoning_details from %d api_messages "
+                        "reasoning_details, anthropic_content_blocks and any "
+                        "content-list thinking blocks from api_messages "
                         "(canonical messages unchanged)",
-                        agent.log_prefix, _api_stripped,
+                        agent.log_prefix,
                     )
                     continue
 
