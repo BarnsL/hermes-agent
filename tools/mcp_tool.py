@@ -3602,6 +3602,12 @@ def _handle_session_expired_and_retry(
         server_name, op_description, exc,
     )
 
+    # Trigger orphan reap before reconnecting transport so stale processes/pipes are cleared
+    try:
+        _kill_orphaned_mcp_children(include_active=True, server_name=server_name)
+    except Exception as _reap_err:
+        logger.debug("Pre-reconnect orphan reap failed for %s: %s", server_name, _reap_err)
+
     # Trigger the same reconnect mechanism the OAuth recovery path
     # uses, then wait briefly for the new session to come back ready.
     if not _signal_reconnect_and_wait(
@@ -5881,6 +5887,23 @@ def _kill_orphaned_mcp_children(
             "Force-killed MCP process %d (%s) after SIGTERM timeout",
             pid, server_name,
         )
+
+    # Phase 4 (Windows): Sweep untracked zombie MCP processes matching server_name or curio_kb
+    if os.name == "nt":
+        try:
+            import psutil
+            target_name = (server_name or "").lower()
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    cmd_str = " ".join(proc.info.get("cmdline") or []).lower()
+                    if "mcp_server" in cmd_str:
+                        if not target_name or target_name in cmd_str or "curio_kb" in cmd_str:
+                            proc.kill()
+                            logger.info("Windows reaper force-killed zombie MCP process %d (%s)", proc.info["pid"], cmd_str[:80])
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception as win_err:
+            logger.debug("Windows psutil zombie sweep error: %s", win_err)
 
 
 def _stop_mcp_loop_if_idle() -> bool:

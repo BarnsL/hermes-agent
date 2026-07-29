@@ -133,6 +133,11 @@ from gateway.platforms.base import (
     validate_inbound_media_size,
 )
 from tools.url_safety import is_safe_url
+from plugins.platforms.discord.mention_resolution import (
+    MentionCandidate,
+    candidates_from_members,
+    repair_outbound_mentions,
+)
 
 
 def _truncate_discord_component_text(text: str, limit: int) -> str:
@@ -941,6 +946,34 @@ class DiscordAdapter(BasePlatformAdapter):
         # Mirrors the Telegram #58563 fix. Entries are dropped on finalize.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+        # PURPLE-DISCORD-MENTIONS-2026-07-29
+        # Keep the triggering message's real Member objects as short-lived
+        # mention hints.  Outbound sends use these before attempting one bounded
+        # guild lookup, so model placeholders cannot escape as literal <@[ID]>
+        # strings and a transient lookup failure cannot fail the whole reply.
+        extra = self.config.extra if isinstance(getattr(self.config, "extra", None), dict) else {}
+        self._mention_resolution_enabled = str(
+            extra.get("resolve_mentions", True)
+        ).strip().lower() not in {"false", "0", "no", "off"}
+        self._mention_member_lookup_enabled = str(
+            extra.get("mention_member_lookup", False)
+        ).strip().lower() in {"true", "1", "yes", "on"}
+        self._mention_hint_ttl_seconds = max(
+            30.0,
+            min(
+                900.0,
+                self._finite_positive_config_float(
+                    "mention_hint_ttl_seconds",
+                    180.0,
+                ),
+            ),
+        )
+        self._mention_hints_by_message: Dict[
+            str, tuple[float, tuple[MentionCandidate, ...]]
+        ] = {}
+        self._mention_hints_by_channel: Dict[
+            str, tuple[float, tuple[MentionCandidate, ...]]
+        ] = {}
 
     def _config_value(
         self, key: str, default: Any, *, env_key: Optional[str] = None
@@ -1115,6 +1148,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 # online when Members Intent isn't enabled in the Developer Portal.
                 any(entry != "*" and not entry.isdigit() for entry in self._allowed_user_ids)
                 or bool(self._allowed_role_ids)  # Need members intent for role lookup
+                # Explicit opt-in, verified against the Developer Portal before
+                # deployment.  This powers the bounded exact-name self-repair
+                # path for users not explicitly mentioned in the inbound turn.
+                or self._mention_member_lookup_enabled
             )
             intents.voice_states = True
 
@@ -2120,11 +2157,15 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
             free_channels = self._discord_free_response_channels()
+            bot_owns_thread = (
+                isinstance(message.channel, discord.Thread)
+                and self._thread_started_by_bot(message.channel)
+            )
             in_bot_thread = (
                 isinstance(message.channel, discord.Thread)
                 and str(message.channel.id) in self._threads
                 and not self._discord_thread_require_mention()
-            )
+            ) or bot_owns_thread
             if (
                 self._discord_require_mention()
                 and "*" not in free_channels
@@ -2813,6 +2854,186 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
+    # PURPLE-DISCORD-MENTIONS-2026-07-29
+    def _remember_message_mentions(
+        self,
+        message: DiscordMessage,
+        effective_channel_id: str,
+    ) -> None:
+        """Cache real, non-bot targets from the triggering Discord message.
+
+        ``message.mentions`` is authoritative Discord data.  Capturing it before
+        the model runs lets the send boundary repair a later ``<@[ID]>`` without
+        asking the model to remember a skill or exposing a raw snowflake in its
+        prompt.  Entries are short-lived and bounded to avoid stale cross-turn
+        targeting.
+        """
+
+        if not self._mention_resolution_enabled:
+            return
+        bot_user_id = str(getattr(getattr(self._client, "user", None), "id", "") or "")
+        candidates = candidates_from_members(
+            getattr(message, "mentions", ()) or (),
+            exclude_user_id=bot_user_id,
+        )
+        if not candidates:
+            return
+
+        now = time.monotonic()
+        record = (now, candidates)
+        self._mention_hints_by_message[str(message.id)] = record
+        self._mention_hints_by_channel[str(effective_channel_id)] = record
+        self._prune_mention_hints(now)
+
+    def _prune_mention_hints(self, now: Optional[float] = None) -> None:
+        """Expire old mention hints and enforce a hard memory bound."""
+
+        current = time.monotonic() if now is None else now
+        cutoff = current - self._mention_hint_ttl_seconds
+        for cache in (
+            self._mention_hints_by_message,
+            self._mention_hints_by_channel,
+        ):
+            stale = [key for key, (seen, _value) in cache.items() if seen < cutoff]
+            for key in stale:
+                cache.pop(key, None)
+            if len(cache) > 512:
+                for key, _record in sorted(
+                    cache.items(),
+                    key=lambda item: item[1][0],
+                )[: len(cache) - 512]:
+                    cache.pop(key, None)
+
+    def _mention_hints_for_send(
+        self,
+        *,
+        channel_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[MentionCandidate, ...]:
+        """Return fresh hints for the exact triggering message when possible."""
+
+        now = time.monotonic()
+        self._prune_mention_hints(now)
+        message_keys = [
+            str(reply_to or ""),
+            str((metadata or {}).get("reply_to_message_id") or ""),
+        ]
+        for key in message_keys:
+            if key and key in self._mention_hints_by_message:
+                return self._mention_hints_by_message[key][1]
+
+        # Streaming and non-reply deliveries do not always carry the inbound
+        # message ID.  A short-lived channel-local fallback repairs those turns
+        # without ever crossing channel boundaries.
+        record = self._mention_hints_by_channel.get(str(channel_id))
+        if record and now - record[0] <= self._mention_hint_ttl_seconds:
+            return record[1]
+        return ()
+
+    async def _lookup_guild_mention_candidates(
+        self,
+        channel: Any,
+        query: str,
+    ) -> tuple[MentionCandidate, ...]:
+        """Try cache, then one bounded Discord gateway query for a plain name."""
+
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            guild = getattr(getattr(channel, "parent", None), "guild", None)
+        if guild is None:
+            return ()
+
+        cached = candidates_from_members(getattr(guild, "members", ()) or ())
+        wanted = str(query or "").strip().lstrip("@").casefold()
+        exact_cached = tuple(
+            candidate
+            for candidate in cached
+            if wanted in {name.casefold() for name in candidate.names}
+        )
+        if exact_cached or not self._mention_member_lookup_enabled:
+            return exact_cached
+
+        query_members = getattr(guild, "query_members", None)
+        if not callable(query_members):
+            return ()
+        try:
+            # This is the only network self-repair step.  It is read-only,
+            # exact-match filtered by mention_resolution.py, and deliberately
+            # time-bounded so a lookup can never recreate a hanging bot turn.
+            members = await asyncio.wait_for(
+                query_members(query=query, limit=10, cache=True),
+                timeout=2.5,
+            )
+            return candidates_from_members(members or ())
+        except Exception as exc:
+            logger.warning(
+                "[%s] Discord mention lookup failed; using non-pinging fallback: %s",
+                self.name,
+                exc,
+            )
+            return ()
+
+    async def _repair_outbound_discord_mentions(
+        self,
+        content: str,
+        channel: Any,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Resolve safe user pings and degrade failures before Discord send/edit."""
+
+        if not self._mention_resolution_enabled:
+            return content
+
+        channel_id = str(getattr(channel, "id", "") or "")
+        hints = self._mention_hints_for_send(
+            channel_id=channel_id,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+        async def lookup(query: str) -> tuple[MentionCandidate, ...]:
+            return await self._lookup_guild_mention_candidates(channel, query)
+
+        try:
+            result = await repair_outbound_mentions(
+                content,
+                hint_candidates=hints,
+                lookup=lookup,
+                max_lookup_attempts=3,
+                max_user_mentions=5,
+            )
+        except Exception as exc:
+            # The resolver itself must never become a send blocker.  Retry once
+            # without network lookup so broken placeholders still become safe
+            # non-pinging text before the original reply is delivered.
+            logger.warning(
+                "[%s] Discord mention repair failed; retrying locally: %s",
+                self.name,
+                exc,
+            )
+            result = await repair_outbound_mentions(
+                content,
+                hint_candidates=hints,
+                lookup=None,
+                max_lookup_attempts=0,
+                max_user_mentions=5,
+            )
+
+        if result.changed or result.unresolved_names:
+            logger.info(
+                "[%s] Discord mention repair: placeholders=%d names=%d "
+                "unresolved=%d lookups=%d",
+                self.name,
+                result.repaired_placeholders,
+                result.resolved_names,
+                len(result.unresolved_names),
+                result.lookup_attempts,
+            )
+        return result.content
+
     async def send(
         self,
         chat_id: str,
@@ -2853,6 +3074,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     channel = await self._client.fetch_channel(int(chat_id))
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
+
+            # Enforce mention validity at the last common boundary before any
+            # channel/forum send.  This covers both normal and streamed starts.
+            content = await self._repair_outbound_discord_mentions(
+                content,
+                channel,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
@@ -3099,6 +3329,12 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
             msg = await channel.fetch_message(int(message_id))
+            content = await self._repair_outbound_discord_mentions(
+                content,
+                channel,
+                reply_to=(metadata or {}).get("reply_to_message_id"),
+                metadata=metadata,
+            )
             formatted = self.format_message(content)
 
             _preview_key = (str(chat_id), str(message_id))
@@ -4857,12 +5093,104 @@ class DiscordAdapter(BasePlatformAdapter):
         if resolved_count:
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
 
+    def _sanitize_public_content(self, content: str) -> str:
+        """Strip tool artifacts, local paths, IDs, and injection phrases from public Discord text.
+
+        The gateway already sanitizes final replies; this is a last-line-of-defense
+        pass inside the adapter so any path that reaches send/edit (including
+        status/notice bubbles and direct adapter calls) cannot leak internal tool
+        names, XML tool tags, snowflake IDs, local paths, or prompt-injection
+        fragments. See DISCORD-TOOL-LEAK-20260722.
+        """
+        import re as _re
+
+        if not content:
+            return content
+        cleaned = str(content)
+
+        # Native Hermes tool-call envelope.
+        cleaned = _re.sub(
+            r"(?:<\|tool_call_begin\|>\s*)+[\s\S]*?(?:\s*<\|tool_call_end\|>)+",
+            "",
+            cleaned,
+            flags=_re.DOTALL,
+        )
+        # XML-shaped tool tags and their contents.
+        # DISCORD-TOOL-LEAK-20260727: tool_call was missing from the alternation.
+        # A <tool_call> tag name produces capture group "tool" but the closing
+        # </tool> (from \1) never matches </tool_call> -> the block leaks through.
+        # Added tool_call, tool_call_end, tool_use, and tool_result so that all
+        # common model-output tool shape variants are trapped before reaching the
+        # public channel. Also strips self-closing / orphaned variants in a second
+        # pass so a lone <tool_call> that was never paired doesn't survive.
+        cleaned = _re.sub(
+            r"<(discord|tool|tool_call|tool_use|tool_result|function|mcp|plugin)[^>]*>[\s\S]*?</\1>",
+            "",
+            cleaned,
+            flags=_re.IGNORECASE | _re.DOTALL,
+        )
+        cleaned = _re.sub(
+            r"</?(?:tool_call|tool_use|tool_result|tool_call_end)[^>]*>",
+            "",
+            cleaned,
+            flags=_re.IGNORECASE,
+        )
+        # Bare function signatures that may have escaped parsing.
+        # CURIO-DISCORD-CHANNEL-20260728: Curio (`curio`, `curio_ingest`, `curio_db`) and
+        # SMAB-RO (`smab-ro`, `ig-reel-tracker`) tools are explicitly authorized for Discord
+        # channels and threads. The platform adapter does not clamp or strip curio/smab-ro
+        # execution calls; all curation and reel tracking commands run directly in-channel.
+        cleaned = _re.sub(
+            r"functions\.[a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*:[a-zA-Z0-9_]+\s*\{[^{}]*\}",
+            "",
+            cleaned,
+            flags=_re.IGNORECASE | _re.DOTALL,
+        )
+        # Local filesystem paths.
+        cleaned = _re.sub(
+            r"(?:[A-Za-z]:[\\/][^\s]*|~[\\/][^\s]*|/(?:home|Users|root|tmp|var|etc|opt|usr|app|s?bin|lib|local|data|src|build|dist|cache|config|env)[^\s]*)",
+            "[REDACTED]",
+            cleaned,
+            flags=_re.IGNORECASE,
+        )
+        # PURPLE-DISCORD-MENTIONS-2026-07-29
+        # Redact bare snowflakes without corrupting valid Discord structural
+        # tokens.  The old blanket substitution rewrote <@123...> to <@[ID]>,
+        # which made every correctly resolved user tag non-functional.
+        _discord_token_or_snowflake = _re.compile(
+            r"<@!?\d{17,20}>"
+            r"|<@&\d{17,20}>"
+            r"|<#\d{17,20}>"
+            r"|<a?:[A-Za-z0-9_]{2,32}:\d{17,20}>"
+            r"|\b\d{17,20}\b"
+        )
+        cleaned = _discord_token_or_snowflake.sub(
+            lambda match: (
+                match.group(0)
+                if match.group(0).startswith("<")
+                else "[ID]"
+            ),
+            cleaned,
+        )
+        # Obvious prompt-injection phrases.
+        cleaned = _re.sub(
+            r"\b(?:ignore (?:all |previous |prior )?instructions?|ignore your (?:system|core|base|soul|programming) prompts?|disregard (?:all |previous |prior )?instructions?|you are now .*?(?:mode|assistant|droid|bot)|you are a helpful assistant|(?:new|system|developer|user) instruction)\b",
+            "[REDACTED]",
+            cleaned,
+            flags=_re.IGNORECASE,
+        )
+
+        cleaned = _re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
     def format_message(self, content: str) -> str:
         """Format message for Discord.
 
         Converts GFM markdown tables to bullet-list groups since Discord
-        does not render pipe tables natively.
+        does not render pipe tables natively, and strips any internal tool
+        artifacts or private metadata that escaped the gateway sanitizer.
         """
+        content = self._sanitize_public_content(content)
         if not content:
             return content
         return convert_table_to_bullets(content)
@@ -5845,6 +6173,22 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _thread_started_by_bot(self, thread: Any) -> bool:
+        """Return True if this bot is the thread starter (owner).
+
+        When the bot created a thread, it should be treated as an active
+        participant even before the participation tracker has recorded it,
+        so the first message in a bot-owned thread does not require a
+        mention.
+        """
+        starter = getattr(thread, "starter", None)
+        if starter is None:
+            return False
+        bot_user = getattr(self._client, "user", None)
+        if bot_user is None:
+            return False
+        return starter.id == bot_user.id
+
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
         configured = self.config.extra.get("history_backfill")
@@ -6090,6 +6434,25 @@ class DiscordAdapter(BasePlatformAdapter):
                     "[Recent channel messages]\n"
                     + "\n".join(line for _id, line in collected)
                 )
+
+            # ── Thread parent channel context ──
+            # When we're in a thread, the parent channel contains the conversation
+            # that led to this thread's creation. Fetch and prepend it so the agent
+            # sees the full context flow. (Fix applied 2026-07-28)
+            if is_thread_channel:
+                parent_channel = getattr(channel, "parent", None)
+                if parent_channel is not None:
+                    # Fetch parent context with the same limit, anchored before the
+                    # thread creation (which is before the first thread message)
+                    parent_context = await self._fetch_channel_context(
+                        parent_channel,
+                        before=before,  # Use the same anchor to get context before the thread
+                        reply_target=None,
+                    )
+                    if parent_context:
+                        parent_header = f"[Parent channel context — messages from #{getattr(parent_channel, 'name', 'unknown')} before this thread was created]\n"
+                        blocks.insert(0, f"{parent_header}{parent_context}")
+
             return "\n\n".join(blocks)
 
         except discord.Forbidden:
@@ -7145,11 +7508,12 @@ class DiscordAdapter(BasePlatformAdapter):
             # — UNLESS thread_require_mention is enabled, in which case threads
             # are gated the same as channels.  Useful when multiple bots share
             # a thread.
+            bot_owns_thread = is_thread and self._thread_started_by_bot(message.channel)
             in_bot_thread = (
                 is_thread
                 and thread_id in self._threads
                 and not self._discord_thread_require_mention()
-            )
+            ) or bot_owns_thread
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
@@ -7243,6 +7607,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # When auto-threading kicked in, route responses to the new thread
         effective_channel = auto_threaded_channel or message.channel
+        # Preserve explicit non-bot mention targets before agent dispatch.  The
+        # outbound adapter uses these authoritative hints to repair placeholders
+        # or exact display names without trusting model-invented user IDs.
+        self._remember_message_mentions(message, str(effective_channel.id))
 
         # Determine chat type
         if isinstance(message.channel, discord.DMChannel):
@@ -7446,8 +7814,25 @@ class DiscordAdapter(BasePlatformAdapter):
             #     "[Replying to: ...]" snippet with no surrounding context)
             # DMs skip entirely because every DM message triggers the bot,
             # so the session transcript already has everything.
-            # Auto-threaded messages also skip — we just created the thread,
-            # there's nothing prior to backfill.
+            #
+            # ── PURPLE INDUSTRIES CUSTOM (DISCORD-016, 2026-07-28) ────────
+            # RE-APPLY AFTER EVERY HERMES UPDATE — see
+            # Hermes-Purple-Industries/CUSTOM-CODE-MANIFEST.md.
+            # Auto-threaded messages used to skip backfill entirely, on the
+            # reasoning "we just created the thread, there's nothing prior to
+            # backfill". True of the THREAD — and exactly wrong for the answer,
+            # because the conversation the bot was summoned into is in the
+            # PARENT channel. With DISCORD_AUTO_THREAD on (the default), every
+            # @mention in a text channel spawns a fresh thread, so the bot woke
+            # up in an empty room every single time and could only see the one
+            # line that tagged it. Bishi: "use the full context of the channel
+            # it's in, especially if it makes a thread in that channel."
+            # `message.channel` is still the PARENT here (`effective_channel`
+            # is resolved further down), so we scan it exactly as we would for
+            # a normal mention-gated turn.  _fetch_channel_context stops at the
+            # bot's own last message in that channel and is capped by
+            # discord.history_backfill_limit, so the cost is bounded.
+            _auto_thread_seed = auto_threaded_channel is not None
             _has_mention_gap = require_mention and not is_free_channel and not in_bot_thread
             _is_reply = message.reference is not None
 
@@ -7471,7 +7856,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         with suppress(ValueError, TypeError):
                             _reply_target = _Snowflake(int(_ref_mid))
 
-            if (_has_mention_gap or is_thread or _is_reply) and auto_threaded_channel is None:
+            if _has_mention_gap or is_thread or _is_reply or _auto_thread_seed:
                 _backfill_text = await self._fetch_channel_context(
                     message.channel, before=message, reply_target=_reply_target,
                 )
