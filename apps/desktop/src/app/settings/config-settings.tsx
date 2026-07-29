@@ -477,9 +477,11 @@ export function ConfigSettings({
                 }
                 onChange={value => updateConfig(setNested(config, key, value))}
                 optionLabels={
-                  key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels
-                    : (key === 'tts.provider' || key === 'stt.provider') ? { conversoar: 'ConversoAR' }
-                    : undefined
+                  key === 'tts.elevenlabs.voice_id'
+                    ? elevenLabsVoiceLabels
+                    : key === 'tts.provider' || key === 'stt.provider'
+                      ? { conversoar: 'ConversoAR' }
+                      : undefined
                 }
                 schema={field}
                 schemaKey={key}

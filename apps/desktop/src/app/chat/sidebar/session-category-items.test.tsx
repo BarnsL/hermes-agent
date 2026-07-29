@@ -1,7 +1,12 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { DropdownMenu, DropdownMenuContent, DropdownMenuSub, DropdownMenuSubTrigger } from '@/components/ui/dropdown-menu'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger
+} from '@/components/ui/dropdown-menu'
 import type { SessionInfo } from '@/hermes'
 import {
   $editingCategoryId,
