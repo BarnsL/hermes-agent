@@ -336,6 +336,12 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    # Kimi 2026-08-01 (CRON-MEM patch, see CUSTOM-CODE-MANIFEST.md):
+    # None = legacy behavior (provider gate follows skip_memory). Cron passes
+    # False explicitly so scheduled sessions keep the external memory
+    # provider's tools/recall while still skipping the built-in
+    # MEMORY.md/USER.md store that skip_memory protects.
+    skip_memory_provider: "bool | None" = None,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -1177,7 +1183,7 @@ def init_agent(
                     print("⚠️  Warning: API key appears invalid or missing")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
-    
+
     # Provider fallback chain — ordered list of backup providers tried
     # when the primary is exhausted (rate-limit, overload, connection
     # failure).  Supports both legacy single-dict ``fallback_model`` and
@@ -1427,9 +1433,12 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    # CRON-MEM (Kimi 2026-08-01): hoisted out of the skip_memory block so the
+    # external provider block below can read it when skip_memory=True — it
+    # previously NameError'd and silently disabled the provider in cron.
+    mem_config = _agent_cfg.get("memory", {})
     if not skip_memory:
         try:
-            mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
@@ -1448,7 +1457,11 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    # CRON-MEM (Kimi 2026-08-01): gate on skip_memory_provider when given, so
+    # cron sessions (skip_memory=True) still load the provider; subagents and
+    # all other callers pass nothing and keep the legacy skip_memory behavior.
+    _skip_mem_provider = skip_memory if skip_memory_provider is None else skip_memory_provider
+    if not _skip_mem_provider:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 

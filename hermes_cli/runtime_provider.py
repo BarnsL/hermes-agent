@@ -1116,10 +1116,24 @@ def _resolve_openrouter_runtime(
         and base_url == (env_openrouter_base_url or "").rstrip("/")
     )
     if _is_openrouter_context:
+        # Honor the config.yaml model.api_key as a fallback when no env var is
+        # set. Previously OpenRouter only looked at explicit_api_key / env vars,
+        # so a key stored in config.yaml was silently ignored and requests were
+        # sent without an Authorization header ("Missing Authentication header").
+        # CRITICAL #37 (2026-07-23): strip surrounding quotes/whitespace from
+        # every env candidate. A key stored as `OPENROUTER_API_KEY=" sk-or-..."`
+        # (quote + leading space, as happened in .env line 536) otherwise yields
+        # an Authorization header of `Bearer " sk-or-...`, which OpenRouter
+        # rejects with HTTP 401 "Missing Authentication header". cfg_api_key is
+        # already stripped at its read site; mirror that for the env vars so no
+        # malformed key source can poison the header again.
+        def _clean_key(v):
+            return (v or "").strip().strip('"').strip("'").strip()
         api_key_candidates = [
             explicit_api_key,
-            _getenv("OPENROUTER_API_KEY"),
-            _getenv("OPENAI_API_KEY"),
+            _clean_key(_getenv("OPENROUTER_API_KEY")),
+            _clean_key(_getenv("OPENAI_API_KEY")),
+            cfg_api_key,
         ]
     else:
         # Custom endpoint: use api_key from config when using config base_url (#1760).

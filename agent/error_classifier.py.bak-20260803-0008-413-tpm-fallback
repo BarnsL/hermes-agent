@@ -1022,26 +1022,6 @@ def _classify_by_status(
         )
 
     if status_code == 413:
-        # Modified by Nous Man — 2026-08-03 — CRITICAL #51: a 413 whose body
-        # names a tokens-per-minute (TPM) ceiling is an ACCOUNT/TIER rate
-        # limit, not true context overflow. Groq's on_demand tier returns
-        # exactly this ("Request too large for model … service tier
-        # `on_demand` on tokens per minute (TPM): Limit 12000, Requested
-        # 45157") for any request whose prompt + reserved max_tokens exceeds
-        # the per-minute bucket — compression can NEVER fix it (the ceiling
-        # is below the system-prompt floor), and routing it into compression
-        # just dies with "Cannot compress further" without ever walking the
-        # fallback chain. Classify as rate_limit so the retry loop falls
-        # back to the next provider immediately, same as a 429. No
-        # credential rotation: the limit is the account's service tier, not
-        # the key.
-        if "tokens per minute" in error_msg or " tpm" in error_msg:
-            return result_fn(
-                FailoverReason.rate_limit,
-                retryable=True,
-                should_rotate_credential=False,
-                should_fallback=True,
-            )
         return result_fn(
             FailoverReason.payload_too_large,
             retryable=True,

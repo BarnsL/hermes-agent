@@ -556,27 +556,7 @@ class ToolRegistry:
                         logger.debug("Tool %s unavailable (check failed)", name)
                     continue
             # Ensure schema always has a "name" field — use entry.name as fallback
-            # Modified by Nous Man — 2026-08-03 — CRITICAL #53: tolerate a
-            # plugin registering an ALREADY OpenAI-wrapped schema
-            # ({"type": "function", "function": {...}}). Wrapping it again
-            # produces {"function": {"type": "function", "function": …}},
-            # which strict providers (Cerebras) reject with HTTP 400
-            # wrong_api_format, poisoning the whole tools array. Unwrap to
-            # the bare function schema first, mirroring
-            # agent/memory_manager.normalize_tool_schema.
-            _entry_schema = entry.schema
-            if (
-                isinstance(_entry_schema, dict)
-                and _entry_schema.get("type") == "function"
-                and isinstance(_entry_schema.get("function"), dict)
-            ):
-                logger.warning(
-                    "Tool %s registered with a pre-wrapped OpenAI schema; "
-                    "unwrapping to bare function form (register bare schemas).",
-                    name,
-                )
-                _entry_schema = _entry_schema["function"]
-            schema_with_name = {**_entry_schema, "name": entry.name}
+            schema_with_name = {**entry.schema, "name": entry.name}
             # Apply runtime-dynamic overrides (e.g. delegate_task description
             # depends on current delegation.max_concurrent_children /
             # max_spawn_depth). Caller side (model_tools.get_tool_definitions)

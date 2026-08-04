@@ -140,206 +140,6 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
-# --- Modified by Nous Man — 2026-08-03 — CRITICAL #58: cron failures DM the owner ---
-# Mirrors the DISCORD-023 operational route (gateway/run.py
-# _discord_dm_owner_operational): a terminally failed scheduled job sends a
-# Discord DM to the owner instead of disappearing into the session log.
-# Rate-sane: the same job+error signature is DM'd at most once per hour;
-# repeats are logged only, and the DM itself notes the cooldown.
-_CRON_FAILURE_DM_COOLDOWN_SECONDS = 3600
-_CRON_FAILURE_DM_STATE_FILE = "failure_dm_cooldown.json"
-
-
-def _cron_failure_dm_signature(job: dict, error: str | None) -> str:
-    """Stable dedup key: job id + normalized error text (digits/whitespace
-    collapsed) so retry noise and timestamps don't defeat the cooldown."""
-    norm = re.sub(r"\d+", "#", (error or "unknown").lower())
-    norm = re.sub(r"\s+", " ", norm).strip()[:120]
-    return f"{job.get('id', '?')}|{norm}"
-
-
-def _cron_failure_dm_state_path() -> Path:
-    return get_hermes_home() / "cron" / _CRON_FAILURE_DM_STATE_FILE
-
-
-def _cron_failure_dm_cooldown_allows(signature: str) -> bool:
-    """True when this signature may be DM'd now (first sighting or cooldown
-    expired). Fail-open on state-file problems: a broken cooldown file must
-    never silence a genuine new failure report."""
-    try:
-        path = _cron_failure_dm_state_path()
-        if not path.exists():
-            return True
-        state = json.loads(path.read_text(encoding="utf-8"))
-        last = float(state.get(signature, 0) or 0)
-        return (time.time() - last) >= _CRON_FAILURE_DM_COOLDOWN_SECONDS
-    except Exception:
-        return True
-
-
-def _cron_failure_dm_record(signature: str) -> None:
-    try:
-        path = _cron_failure_dm_state_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        state = {}
-        if path.exists():
-            try:
-                state = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                state = {}
-        # Bound the file: drop entries older than 7 days.
-        cutoff = time.time() - 7 * 86400
-        state = {k: v for k, v in state.items()
-                 if isinstance(v, (int, float)) and v >= cutoff}
-        state[signature] = time.time()
-        path.write_text(json.dumps(state, indent=1), encoding="utf-8")
-    except Exception as e:
-        logger.debug("cron failure DM cooldown record failed: %s", e)
-
-
-def _dm_owner_cron_failure(
-    job: dict,
-    error: str | None,
-    adapters=None,
-    loop=None,
-    execution_id: str | None = None,
-) -> None:
-    """Best-effort owner Discord DM for a failed cron job (CRITICAL #58).
-
-    Never raises into the caller; every failure degrades to a log line.
-    Route resolution mirrors DISCORD-023 semantics: dm_owner (default) with a
-    valid display.platforms.discord.owner_user_id, else off — never public.
-    Prefers the live gateway discord adapter; falls back to the Discord HTTP
-    API with the bot token from gateway config (standalone tick path).
-    """
-    job_name = job.get("name") or job.get("id") or "cron job"
-    try:
-        # Route gate — same config shape as gateway/run.py's
-        # _resolve_discord_operational_route (kept local: cron must not
-        # import gateway/run.py).
-        try:
-            user_cfg = load_config()
-        except Exception:
-            user_cfg = {}
-        discord_cfg = (
-            (user_cfg or {}).get("display", {}).get("platforms", {}).get("discord", {})
-        )
-        route = str((discord_cfg or {}).get("operational_messages") or "dm_owner").strip().lower()
-        if route not in ("dm_owner", "channel", "off"):
-            route = "dm_owner"
-        owner_id = str((discord_cfg or {}).get("owner_user_id") or "").strip()
-        if route == "dm_owner" and not (owner_id.isdigit() and 17 <= len(owner_id) <= 20):
-            route = "off"
-        if route != "dm_owner":
-            logger.info(
-                "CRON-024 owner-DM route unavailable (route=%s); cron failure "
-                "stays in logs only: job=%s", route, job.get("id"),
-            )
-            return
-
-        signature = _cron_failure_dm_signature(job, error)
-        if not _cron_failure_dm_cooldown_allows(signature):
-            logger.info(
-                "CRON-024 owner-DM suppressed by 1h cooldown (signature already "
-                "reported): job=%s error=%s",
-                job.get("id"), (error or "")[:120],
-            )
-            return
-
-        summary = _summarize_cron_failure_for_delivery(job, error)
-        from datetime import datetime as _dm_dt, timezone as _dm_tz
-        body = (
-            f"🛠 Nous Man operational notice [cron-failure] — "
-            f"{_dm_dt.now(_dm_tz.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-            f"{summary}\n"
-            f"job: {job.get('id', '?')}  execution: {execution_id or '?'}\n"
-            f"(dedup: identical failures are DM'd at most once per hour; "
-            f"repeats stay in logs/agent.log)"
-        )[:1900]
-
-        sent = False
-        # Path 1: live gateway discord adapter (in-process ticker).
-        try:
-            if adapters and loop is not None and getattr(loop, "is_running", lambda: False)():
-                from gateway.config import Platform
-                discord_adapter = None
-                for key, adapter in (adapters.items() if hasattr(adapters, "items") else []):
-                    if key == Platform.DISCORD or "discord" in str(key).lower():
-                        discord_adapter = adapter
-                        break
-                client = getattr(discord_adapter, "_client", None) if discord_adapter else None
-                if client is not None:
-                    async def _send_via_client():
-                        user = await client.fetch_user(int(owner_id))
-                        dm = await user.create_dm()
-                        await dm.send(body)
-                    from agent.async_utils import safe_schedule_threadsafe
-                    future = safe_schedule_threadsafe(_send_via_client(), loop)
-                    if future is not None:
-                        future.result(timeout=20)
-                        sent = True
-        except Exception as e:
-            logger.warning("CRON-024 owner-DM live-adapter path failed: %s", e)
-
-        # Path 2: Discord HTTP API with the bot token (standalone tick or
-        # adapter unavailable).
-        if not sent:
-            try:
-                from gateway.config import load_gateway_config, Platform
-                gw_cfg = load_gateway_config()
-                pcfg = gw_cfg.platforms.get(Platform.DISCORD)
-                token = getattr(pcfg, "token", None) if pcfg else None
-                if token:
-                    import urllib.request as _urlreq
-                    # Modified by Nous Man — 2026-08-03: urllib's default UA is
-                    # Cloudflare-blocked by Discord (error 1010); a discord.py-
-                    # style UA is required on this host.
-                    _DISCORD_API_UA = (
-                        "DiscordBot (https://github.com/Rapptz/discord.py, 2.4.0) "
-                        "Python/3.11"
-                    )
-                    def _discord_api(method, url, payload):
-                        req = _urlreq.Request(
-                            url,
-                            data=json.dumps(payload).encode("utf-8"),
-                            method=method,
-                            headers={
-                                "Authorization": f"Bot {token}",
-                                "Content-Type": "application/json",
-                                "User-Agent": _DISCORD_API_UA,
-                            },
-                        )
-                        with _urlreq.urlopen(req, timeout=15) as resp:
-                            return json.loads(resp.read().decode("utf-8"))
-                    dm = _discord_api(
-                        "POST", "https://discord.com/api/v10/users/@me/channels",
-                        {"recipient_id": owner_id},
-                    )
-                    _discord_api(
-                        "POST",
-                        f"https://discord.com/api/v10/channels/{dm['id']}/messages",
-                        {"content": body},
-                    )
-                    sent = True
-            except Exception as e:
-                logger.warning("CRON-024 owner-DM HTTP path failed: %s", e)
-
-        if sent:
-            _cron_failure_dm_record(signature)
-            logger.info(
-                "CRON-024 owner-DM sent for failed cron job '%s' (job=%s)",
-                job_name, job.get("id"),
-            )
-        else:
-            logger.warning(
-                "CRON-024 owner-DM could not be sent for failed cron job '%s'; "
-                "failure stays in logs only", job_name,
-            )
-    except Exception as e:
-        logger.warning("CRON-024 owner-DM routing failed for job '%s': %s", job_name, e)
-# --- Modified by Nous Man: end (2026-08-03, CRITICAL #58) ---
-
-
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -3565,10 +3365,6 @@ def run_job(
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
-            # CRON-MEM (Kimi 2026-08-01): but DO load the external memory
-            # provider (memory_tencentdb) so cron sessions can recall/search
-            # long-term memory — the built-in store stays skipped above.
-            skip_memory_provider=False,
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
@@ -4061,13 +3857,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         finish_execution(execution_id, success=success, error=error)
-        # Modified by Nous Man — 2026-08-03 — CRITICAL #58: DM the owner on
-        # terminal cron failure (dedup'd 1h per job+error signature).
-        if not success:
-            _dm_owner_cron_failure(
-                job, error, adapters=adapters, loop=loop,
-                execution_id=str(execution_id),
-            )
         return True
 
     except Exception as e:
@@ -4075,12 +3864,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
         finish_execution(execution_id, success=False, error=str(e))
-        # Modified by Nous Man — 2026-08-03 — CRITICAL #58 (same hook,
-        # processing-level failure path).
-        _dm_owner_cron_failure(
-            job, str(e), adapters=adapters, loop=loop,
-            execution_id=str(execution_id),
-        )
         return False
 
 

@@ -100,13 +100,22 @@ def register(
     return entry
 
 
-def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
+def wait_for_response(
+    clarify_id: str,
+    timeout: float,
+    reminder_at_seconds: float = 0,
+    reminder_cb: Optional[Callable[[], None]] = None,
+) -> Optional[str]:
     """Block on the entry's event until resolved or timeout fires.
 
     Polls in 1-second slices so the agent's inactivity heartbeat keeps
     firing — without this, ``Event.wait(timeout=600)`` blocks the thread
     for 10 minutes with zero activity touches and the gateway's inactivity
     watchdog kills the agent while the user is still typing.
+
+    When ``reminder_at_seconds`` > 0 and ``reminder_cb`` is given, the
+    callback fires exactly once once the wait has been running that long
+    (e.g. the gateway posts a "still waiting" nudge into the channel).
 
     Returns the resolved response string, or ``None`` on timeout.
     """
@@ -122,6 +131,7 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
 
     deadline = time.monotonic() + max(timeout, 0.0)
     activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
+    reminder_fired = False
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -130,6 +140,17 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
             break
         if touch_activity_if_due is not None:
             touch_activity_if_due(activity_state, "waiting for user clarify response")
+        if (
+            reminder_cb is not None
+            and not reminder_fired
+            and reminder_at_seconds > 0
+            and time.monotonic() - activity_state["start"] >= reminder_at_seconds
+        ):
+            reminder_fired = True
+            try:
+                reminder_cb()
+            except Exception as exc:
+                logger.warning("Clarify reminder callback failed: %s", exc)
 
     with _lock:
         # Remove from indices regardless of resolution outcome.
@@ -282,6 +303,26 @@ def get_clarify_timeout() -> int:
         return int(agent_cfg.get("clarify_timeout", 3600))
     except Exception:
         return 3600
+
+
+def get_clarify_reminder_interval() -> float:
+    """Read the clarify reminder interval (seconds) from config.
+
+    When a clarify turn has been waiting this long with no user answer, the
+    gateway posts one reminder message into the same channel/thread.  The
+    reminder fires at most once per clarify; the turn itself is still
+    governed by ``get_clarify_timeout``.
+
+    Defaults to 900 (15 minutes).  0 or a negative value disables the
+    reminder.  Reads ``agent.clarify_reminder_interval`` from config.yaml.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        agent_cfg = cfg.get("agent", {}) or {}
+        return float(agent_cfg.get("clarify_reminder_interval", 900))
+    except Exception:
+        return 900.0
 
 
 # =========================================================================

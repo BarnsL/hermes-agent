@@ -1673,25 +1673,8 @@ def _maybe_wrap_anthropic(
         "(model=%s, base_url=%s, api_mode=%s)",
         model, base_url[:60] if base_url else "", api_mode or "auto-detected",
     )
-    # is_oauth must be DERIVED, not hardcoded. This chokepoint is reached for
-    # native Anthropic too — _endpoint_speaks_anthropic_messages() returns True
-    # for hostname == "api.anthropic.com" — via the `custom` provider, a
-    # task-level api_mode: anthropic_messages override, or MoA slot routing.
-    # build_anthropic_client() above already inspects the token itself and emits
-    # `Authorization: Bearer` for an OAuth one, so hardcoding False here made the
-    # FLAG disagree with the headers actually on the wire, and the flag is what
-    # gates the two OAuth-only request rewrites in build_anthropic_kwargs:
-    #   - the "You are Claude Code…" system prefix — omitting it makes Anthropic
-    #     reject the request with a bare HTTP 429 rate_limit_error (no
-    #     retry-after, no ratelimit headers), which reads as throttling and is
-    #     retried forever instead of being fixed;
-    #   - mcp__ tool-name normalization — see _to_oauth_wire_name.
-    # Third-party gateways are unaffected: their keys don't match the OAuth
-    # shapes, so this still evaluates False for them.
-    from agent.anthropic_adapter import _is_oauth_token
     return AnthropicAuxiliaryClient(
-        real_client, model, api_key, base_url,
-        is_oauth=_is_oauth_token(api_key),
+        real_client, model, api_key, base_url, is_oauth=False,
     )
 
 
@@ -2833,31 +2816,6 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         # healthy (it resolves the env token directly).
         entry = None
         token = explicit_api_key or resolve_anthropic_token()
-    if not token and not explicit_api_key:
-        # Selected entry exists but carries NO secret — retry the resolver.
-        #
-        # A pooled entry can be a pure POINTER: source="env:CLAUDE_CODE_OAUTH_TOKEN"
-        # with an empty access_token, re-hydrated from the environment on each
-        # load. Hydration reads dotenv + os.environ only
-        # (credential_pool._get_env_prefer_dotenv), and on Windows the Claude
-        # *subscription* token commonly lives ONLY in HKCU\Environment — not in
-        # ~/.hermes/.env and not in the gateway's inherited process env — so the
-        # pointer never fills in and _pool_runtime_api_key() returns "".
-        #
-        # Such an entry is still SELECTABLE: the unhydrated-entry guard in
-        # CredentialPool._available_entries is scoped to
-        # ``auth_type == AUTH_TYPE_API_KEY``, so an empty *oauth* entry passes
-        # through. That makes the branch above take the pooled path and shadow
-        # the resolver, turning a working credential into "not found".
-        #
-        # resolve_anthropic_token() recovers it via _windows_user_env_fallback()
-        # (a direct winreg read of HKCU\Environment). The MAIN agent calls that
-        # resolver unconditionally, which is why main sessions stayed healthy
-        # while every auxiliary side channel (vision, compression, titles, MoA)
-        # logged "anthropic requested but no Anthropic credentials found".
-        # Dropping the stale entry also restores the default base_url below.
-        entry = None
-        token = resolve_anthropic_token()
     if not token:
         return None, None
 
@@ -7644,73 +7602,31 @@ async def async_call_llm(
     effective_extra_body.update(extra_body or {})
 
     if task == "vision":
-        # Build a fallback chain for vision: primary config first, then
-        # auxiliary.vision.fallback_chain entries in order.
-        _vision_fb = []
-        try:
-            from hermes_cli.config import load_config_readonly, cfg_get
-            _cfg = load_config_readonly()
-            _chain = cfg_get(_cfg, "auxiliary", "vision", "fallback_chain") or []
-            if isinstance(_chain, list):
-                for entry in _chain:
-                    if isinstance(entry, dict) and entry.get("provider"):
-                        _vision_fb.append(entry)
-        except Exception:
-            pass
-        # Prepend the primary vision config as the first entry
-        _vision_fb.insert(0, {
-            "provider": resolved_provider if resolved_provider != "auto" else (provider or ""),
-            "model": resolved_model or model,
-            "base_url": resolved_base_url or base_url,
-            "api_key": resolved_api_key or api_key,
-        })
-        # Try each provider in the chain until one succeeds
-        last_err = None
-        for fb_entry in _vision_fb:
-            fb_prov = fb_entry.get("provider", "").strip()
-            fb_model = fb_entry.get("model", "").strip()
-            fb_url = fb_entry.get("base_url", "") or None
-            fb_key = fb_entry.get("api_key", "") or None
-            if not fb_prov:
-                continue
-            try:
-                effective_provider, client, final_model = resolve_vision_provider_client(
-                    provider=fb_prov or None,
-                    model=fb_model or None,
-                    base_url=fb_url or None,
-                    api_key=fb_key or None,
-                    async_mode=True,
-                    main_runtime=main_runtime,
-                )
-                if client is None:
-                    if fb_prov and fb_prov != "auto" and not fb_url:
-                        logger.warning(
-                            "Vision provider %s unavailable, falling back to auto vision backends",
-                            fb_prov,
-                        )
-                        effective_provider, client, final_model = resolve_vision_provider_client(
-                            provider="auto",
-                            model=fb_model,
-                            async_mode=True,
-                            main_runtime=main_runtime,
-                        )
-                if client is not None:
-                    resolved_provider = effective_provider or fb_prov
-                    break  # success — use this client
-            except Exception as e:
-                last_err = e
-                logger.info("Vision fallback: %s/%s failed (%s), trying next...",
-                            fb_prov, fb_model, str(e)[:100])
-        else:
-            # All fallbacks exhausted
-            if last_err is not None:
-                raise RuntimeError(
-                    f"All vision providers in the fallback chain failed. "
-                    f"Last error: {last_err}. "
-                    f"Run: hermes setup") from last_err
+        effective_provider, client, final_model = resolve_vision_provider_client(
+            provider=resolved_provider if resolved_provider != "auto" else provider,
+            model=resolved_model or model,
+            base_url=resolved_base_url or base_url,
+            api_key=resolved_api_key or api_key,
+            async_mode=True,
+            main_runtime=main_runtime,
+        )
+        if client is None and resolved_provider != "auto" and not resolved_base_url:
+            logger.warning(
+                "Vision provider %s unavailable, falling back to auto vision backends",
+                resolved_provider,
+            )
+            effective_provider, client, final_model = resolve_vision_provider_client(
+                provider="auto",
+                model=resolved_model,
+                async_mode=True,
+                main_runtime=main_runtime,
+            )
+        if client is None:
             raise RuntimeError(
-                f"No vision provider available for provider={resolved_provider}. "
-                f"Run: hermes setup")
+                f"No LLM provider configured for task={task} provider={resolved_provider}. "
+                f"Run: hermes setup"
+            )
+        resolved_provider = effective_provider or resolved_provider
     else:
         client, final_model = _get_cached_client(
             resolved_provider,

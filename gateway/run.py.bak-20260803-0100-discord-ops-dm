@@ -634,7 +634,7 @@ def _looks_like_internal_narration(text: str) -> bool:
 # --- Modified by Nous Man: end ---
 
 
-def _sanitize_gateway_final_response(platform: Any, text: str, chat_type: "str | None" = None) -> str:
+def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
     Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
@@ -644,12 +644,6 @@ def _sanitize_gateway_final_response(platform: Any, text: str, chat_type: "str |
     local paths, or platform IDs. Only programmatic surfaces in
     ``_GATEWAY_RAW_TEXT_PLATFORMS`` (CLI/TUI ``local`` diagnostics, API JSON,
     webhook payloads) keep the raw text unchanged.
-
-    Modified by Nous Man — 2026-08-03 — DISCORD-023: when ``chat_type`` names
-    a non-DM Discord surface, operational diagnostics (provider failures,
-    fallback notices, compression/payload errors) are SUPPRESSED here — the
-    caller reroutes the detail to the owner's DM instead. Silence in public
-    matches DISCORD-020 ("final answer only"): a failed turn has no answer.
     """
     if not text:
         return text
@@ -668,33 +662,6 @@ def _sanitize_gateway_final_response(platform: Any, text: str, chat_type: "str |
     redacted = _sanitize_tool_path_and_injection_leakage(redacted, platform)
     if (
         _gateway_platform_value(platform) == "discord"
-        and chat_type is not None
-        and chat_type != "dm"
-        and _is_operational_diagnostic(redacted)
-    ):
-        # DISCORD-023: never post operational noise to public Discord
-        # surfaces; the caller DMs the owner the technical detail.
-        logger.info(
-            "DISCORD-023 operational final response suppressed on non-DM "
-            "surface (%d chars, rerouted to owner DM): %s",
-            len(redacted),
-            redacted[:200],
-        )
-        return ""
-    if (
-        _gateway_platform_value(platform) == "discord"
-        # ponytail: 2026-08-03 — DM exemption per owner directive 14:10/14:13:
-        # "Terminal outputs/progress are OK in DM (not in server channels).
-        # Remember this." The DISCORD-020 thought-leak guard suppressed three
-        # substantive owner-DM replies on 2026-08-03 (~12:07/13:02/14:01,
-        # logs/discord-output-guard.jsonl) after misclassifying status/progress
-        # content as internal-jargon. DMs to the operator are a private,
-        # trusted surface (DISCORD-018/019 already treat owner-DM as
-        # unrestricted), so skip narration suppression when chat_type == "dm".
-        # None/unknown chat_type still suppresses (fail-closed); server
-        # channels and threads keep full guarding. Secret redaction above is
-        # unchanged and still runs on every surface.
-        and chat_type != "dm"
         and _looks_like_internal_narration(redacted)
     ):
         # Modified by Nous Man — 2026-08-02 — DISCORD-020 diagnostics:
@@ -763,87 +730,6 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _looks_like_gateway_provider_error(text):
         return _gateway_provider_error_reply(text)
     return text
-
-
-# --- Modified by Nous Man: begin (2026-08-03, DISCORD-023 — operational
-# diagnostics go to the owner's DM, never to public Discord channels) ---
-#
-# Owner directive 2026-08-03 (verbatim): "instead of posting that shit in
-# public channel, make it dm me those kinda errors instead". Trigger: the
-# 2026-08-02 23:17 incident sprayed 4 operational messages (provider-failed
-# notice, fallback switch, 413 compression attempt, terminal 413) into a
-# group channel (CRITICAL #51/#56).
-#
-# `_is_operational_diagnostic` identifies infrastructure noise: provider
-# failures, fallback switches, compression attempts, 4xx/5xx envelopes —
-# whether raw (from the agent's status buffer / error returns) or already
-# rewritten by _gateway_provider_error_reply. Length/newline guards mirror
-# _looks_like_gateway_provider_error so ordinary assistant prose that merely
-# mentions a number is never classified as operational.
-_OPERATIONAL_DIAGNOSTIC_RE = re.compile(
-    r"("
-    r"switching to fallback"
-    r"|fallback (?:activated|provider|model)"
-    r"|compression attempt"
-    r"|cannot compress"
-    r"|compress(?:ed|ing).{0,40}retr"
-    r"|payload too large"
-    r"|\b41[03]\b|\b429\b|\b402\b|\b5\d\d\b"
-    r"|rate[- ]limit"
-    r"|out of quota or credit"
-    r"|provider (?:authentication failed|rejected|failed|is rate-limiting)"
-    r"|model provider"
-    r"|billing or credits"
-    r"|provider unreachable"
-    r"|[🔄🗜⏱💳🔐]"
-    r")",
-    re.IGNORECASE,
-)
-
-
-def _is_operational_diagnostic(text: str) -> bool:
-    """True when text is operational/infrastructure noise, not an answer.
-
-    Combines the provider-error envelope shape with a marker scan. Guarded to
-    short texts (real diagnostics are 1-4 lines); longer assistant answers
-    that merely mention a status code are NOT operational.
-    """
-    if not text:
-        return False
-    body = str(text).strip()
-    if len(body) > 600 or body.count("\n") > 5:
-        return False
-    if _looks_like_gateway_provider_error(body):
-        return True
-    return bool(_OPERATIONAL_DIAGNOSTIC_RE.search(body))
-
-
-def _resolve_discord_operational_route(user_config: dict) -> tuple:
-    """Return (route, owner_user_id) for Discord operational messages.
-
-    route is one of "dm_owner" (default), "channel" (legacy behavior),
-    "off" (suppress entirely). owner_user_id comes from
-    display.platforms.discord.owner_user_id; when missing/invalid the route
-    degrades to "off" — never "channel" — because the standing rule is that
-    operational noise must not reach public surfaces (DISCORD-023).
-    """
-    route = "dm_owner"
-    owner_id = ""
-    try:
-        discord_cfg = (
-            (user_config or {}).get("display", {}).get("platforms", {}).get("discord", {})
-        )
-        if isinstance(discord_cfg, dict):
-            route = str(discord_cfg.get("operational_messages") or "dm_owner").strip().lower()
-            owner_id = str(discord_cfg.get("owner_user_id") or "").strip()
-        if route not in ("dm_owner", "channel", "off"):
-            route = "dm_owner"
-    except Exception:
-        route, owner_id = "dm_owner", ""
-    if route == "dm_owner" and not (owner_id.isdigit() and 17 <= len(owner_id) <= 20):
-        route = "off"
-    return route, owner_id
-# --- Modified by Nous Man: end (2026-08-03, DISCORD-023) ---
 
 
 def render_notice_line(notice) -> str:
@@ -13365,35 +13251,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
-                # Modified by Nous Man — 2026-08-03 — DISCORD-023: on public
-                # Discord surfaces, an operational/terminal-failure final
-                # response is suppressed from the channel and the technical
-                # detail is DMed to the owner instead (status lines already
-                # reroute in _status_callback_sync).
-                if (
-                    source.platform == Platform.DISCORD
-                    and getattr(source, "chat_type", "dm") != "dm"
-                    and _is_operational_diagnostic(response)
-                ):
-                    try:
-                        _ops_adapter = self._adapter_for_source(source)
-                        _ops_detail = (
-                            f"final response suppressed in channel\n{response.strip()}"
-                            f"\nmodel: {agent_result.get('model') or '?'}"
-                            f" error: {str(agent_result.get('error') or '')[:400]}"
-                        )
-                        await self._discord_dm_owner_operational(
-                            _ops_adapter,
-                            kind="terminal-failure",
-                            detail=_ops_detail,
-                            source=source,
-                        )
-                    except Exception as _ops_exc:
-                        logger.warning("DISCORD-023 final-response DM failed: %s", _ops_exc)
-                response = _sanitize_gateway_final_response(
-                    source.platform, response,
-                    chat_type=getattr(source, "chat_type", None),
-                )
+                response = _sanitize_gateway_final_response(source.platform, response)
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -19228,73 +19086,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return get_hermes_home()
 
-    # Modified by Nous Man — 2026-08-03 — DISCORD-023: operational diagnostics
-    # (provider failures, fallback switches, compression attempts, 4xx/5xx
-    # detail) are rerouted from public Discord surfaces to the OWNER's DM.
-    # Owner id + route come from display.platforms.discord
-    # (.operational_messages / .owner_user_id); with no valid owner id the
-    # route degrades to "off" (suppress) — never back to the channel.
-    async def _discord_dm_owner_operational(
-        self,
-        adapter: Any,
-        *,
-        kind: str,
-        detail: str,
-        source: Any = None,
-    ) -> bool:
-        """DM an operational diagnostic to the Discord owner. True on send."""
-        try:
-            _cfg = _load_gateway_config()
-        except Exception:
-            _cfg = {}
-        route, owner_id = _resolve_discord_operational_route(_cfg)
-        if route != "dm_owner" or not owner_id:
-            logger.info(
-                "DISCORD-023 owner-DM route unavailable (route=%s); diagnostic "
-                "stays in logs only: %s", route, str(detail or "")[:160],
-            )
-            return False
-        client = getattr(adapter, "_client", None)
-        if client is None:
-            return False
-        try:
-            dm_channel_id = getattr(self, "_discord_owner_dm_channel_id", None)
-            if not dm_channel_id:
-                user = await client.fetch_user(int(owner_id))
-                dm = await user.create_dm()
-                dm_channel_id = str(dm.id)
-                self._discord_owner_dm_channel_id = dm_channel_id
-            _src = ""
-            try:
-                if source is not None:
-                    _src = (
-                        f"\nsurface: {getattr(source, 'chat_type', '?')}"
-                        f":{getattr(source, 'chat_id', '?')}"
-                        f" session: {getattr(source, 'session_id', '') or '?'}"
-                    )
-            except Exception:
-                pass
-            from datetime import datetime as _op_dt, timezone as _op_tz
-            # Modified by Nous Man — 2026-08-03 — CRITICAL #58: .now() needs the
-            # timezone.utc INSTANCE, not the timezone class (latent TypeError
-            # would have killed every live ops DM on first real event).
-            body = (
-                f"🛠 Nous Man operational notice [{kind}] — "
-                f"{_op_dt.now(_op_tz.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-                f"{str(detail or '').strip()[:1800]}{_src}"
-            )
-            result = await adapter.send(dm_channel_id, body)
-            ok = bool(getattr(result, "success", False))
-            if not ok:
-                logger.warning(
-                    "DISCORD-023 owner-DM send failed: %s",
-                    getattr(result, "error", "?"),
-                )
-            return ok
-        except Exception as exc:
-            logger.warning("DISCORD-023 owner-DM routing failed: %s", exc)
-            return False
-
     async def _run_agent_inner(
         self,
         message: str,
@@ -20306,39 +20097,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _redact_gateway_user_facing_secrets(str(message or ""))[:160],
                 )
                 return
-            # Modified by Nous Man — 2026-08-03 — DISCORD-023: operational
-            # diagnostics (provider failures, fallback switches, compression
-            # attempts, 4xx/5xx detail) never post to public Discord surfaces.
-            # They are rerouted to the owner's DM (raw + prepared text), or
-            # suppressed entirely when no owner id/route is configured.
-            if (
-                source.platform == Platform.DISCORD
-                and getattr(source, "chat_type", "dm") != "dm"
-                and _is_operational_diagnostic(str(message or ""))
-            ):
-                logger.info(
-                    "DISCORD-023 operational status rerouted to owner DM "
-                    "(surface=%s:%s event=%s): %s",
-                    getattr(source, "chat_type", "?"),
-                    getattr(source, "chat_id", "?"),
-                    event_type,
-                    str(message or "")[:160],
-                )
-                safe_schedule_threadsafe(
-                    self._discord_dm_owner_operational(
-                        _status_adapter,
-                        kind=f"status/{event_type}",
-                        detail=(
-                            f"{str(message or '').strip()}\n\n"
-                            f"(as would have posted: {prepared_message.strip()})"
-                        ),
-                        source=source,
-                    ),
-                    _loop_for_step,
-                    logger=logger,
-                    log_message="DISCORD-023 owner-DM scheduling error",
-                )
-                return
             _fut = safe_schedule_threadsafe(
                 _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
                 _loop_for_step,
@@ -21002,26 +20760,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return "[clarify prompt could not be delivered]"
 
                 timeout = _clarify_mod.get_clarify_timeout()
-                _reminder_interval = _clarify_mod.get_clarify_reminder_interval()
-
-                def _clarify_reminder_cb() -> None:
-                    safe_schedule_threadsafe(
-                        _status_adapter.send(
-                            _status_chat_id,
-                            "⏳ Still holding this turn for your answer — reply in this channel when ready. (This turn auto-stops at the safety limit.)",
-                            metadata=_status_thread_metadata,
-                        ),
-                        _loop_for_step,
-                        logger=logger,
-                        log_message="Clarify reminder failed to schedule",
-                    )
-
-                response = _clarify_mod.wait_for_response(
-                    clarify_id,
-                    timeout=float(timeout),
-                    reminder_at_seconds=_reminder_interval,
-                    reminder_cb=_clarify_reminder_cb,
-                )
+                response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
                 if response is None or response == "":
                     # Timeout or session-boundary cancellation
                     return f"[user did not respond within {int(timeout / 60)}m]"
@@ -21523,26 +21262,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 final_response = _normalize_empty_agent_response(
                     result, final_response or "", history_len=len(agent_history),
                 )
-                # Modified by Nous Man — 2026-08-03 — DISCORD-023: pass the
-                # surface type so operational failures stay off public
-                # Discord channels (the outer handler DMs the owner).
-                final_response = _sanitize_gateway_final_response(
-                    source.platform, final_response,
-                    chat_type=getattr(source, "chat_type", None),
-                )
+                final_response = _sanitize_gateway_final_response(source.platform, final_response)
                 if not final_response:
-                    # DISCORD-023: do NOT re-fill an operational error line
-                    # for public Discord surfaces — it would be suppressed
-                    # (and owner-DMed) one layer up anyway.
-                    _is_public_discord = (
-                        source.platform == Platform.DISCORD
-                        and getattr(source, "chat_type", "dm") != "dm"
-                    )
-                    if result.get("error") and not _is_public_discord:
-                        final_response = f"⚠️ {result['error']}"
-                    # For public Discord, leave "" — the outer handler
-                    # suppresses the operational line from the channel and
-                    # DMs the owner the technical detail (single-sourced).
+                    final_response = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
                     "final_response": final_response,
                     "messages": result.get("messages", []),

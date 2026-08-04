@@ -816,7 +816,11 @@ def _build_schema(
             "Available actions:\n"
             f"{manifest_block}\n\n"
             "Use the channel_id from the current conversation context. "
-            "Use search_members to look up user IDs by name prefix."
+            "Use search_members to look up user IDs by name prefix. When the "
+            "user asks you to tag a named member, select only an exact, "
+            "unambiguous result and compose Discord user-mention syntax from "
+            "the returned numeric user_id. Never invent or expose an ID "
+            "placeholder. `discord_at_mentions` is not an executable tool."
             f"{content_note}"
         )
 

@@ -482,6 +482,9 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        # CRON-MEM (Kimi 2026-08-01): forwarded to init_agent; None = legacy
+        # (provider gate follows skip_memory). Cron passes False explicitly.
+        skip_memory_provider: "bool | None" = None,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -558,6 +561,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            skip_memory_provider=skip_memory_provider,
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,

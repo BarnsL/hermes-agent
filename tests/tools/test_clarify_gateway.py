@@ -202,6 +202,56 @@ class TestClarifyPrimitive:
         assert isinstance(timeout, int)
         assert timeout > 0
 
+    def test_reminder_fires_once(self):
+        """reminder_cb fires exactly once after reminder_at_seconds elapse."""
+        from tools import clarify_gateway as cm
+
+        cm.register("idr1", "skr1", "Q?", ["A"])
+        calls = []
+        result = cm.wait_for_response(
+            "idr1",
+            timeout=0.6,
+            reminder_at_seconds=0.1,
+            reminder_cb=lambda: calls.append(1),
+        )
+        assert result is None  # timed out with no response
+        assert len(calls) == 1
+
+    def test_reminder_disabled_with_zero(self):
+        """reminder_at_seconds=0 means no reminder ever fires."""
+        from tools import clarify_gateway as cm
+
+        cm.register("idr2", "skr2", "Q?", ["A"])
+        calls = []
+        cm.wait_for_response(
+            "idr2",
+            timeout=0.2,
+            reminder_at_seconds=0,
+            reminder_cb=lambda: calls.append(1),
+        )
+        assert calls == []
+
+    def test_reminder_not_fired_when_resolved_early(self):
+        """A quick resolve before the interval skips the reminder entirely."""
+        from tools import clarify_gateway as cm
+
+        cm.register("idr3", "skr3", "Q?", ["A"])
+
+        def resolver():
+            time.sleep(0.05)
+            cm.resolve_gateway_clarify("idr3", "A")
+
+        threading.Thread(target=resolver).start()
+        calls = []
+        result = cm.wait_for_response(
+            "idr3",
+            timeout=2.0,
+            reminder_at_seconds=1.0,
+            reminder_cb=lambda: calls.append(1),
+        )
+        assert result == "A"
+        assert calls == []
+
 
 class TestGatewayTextIntercept:
     """The gateway's _handle_message intercepts text replies to pending clarifies."""

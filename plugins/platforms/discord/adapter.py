@@ -5157,6 +5157,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Redact bare snowflakes without corrupting valid Discord structural
         # tokens.  The old blanket substitution rewrote <@123...> to <@[ID]>,
         # which made every correctly resolved user tag non-functional.
+        # Modified by Nous Man — 2026-08-02 — DISCORD-021: snowflake redaction
+        # REMOVED entirely (master's order): Discord user/channel/role IDs are
+        # visible to every member of the server anyway, and masking them broke
+        # mentions and hid public info. Structural tokens AND bare IDs now pass
+        # through verbatim on Discord.
         _discord_token_or_snowflake = _re.compile(
             r"<@!?\d{17,20}>"
             r"|<@&\d{17,20}>"
@@ -5165,11 +5170,7 @@ class DiscordAdapter(BasePlatformAdapter):
             r"|\b\d{17,20}\b"
         )
         cleaned = _discord_token_or_snowflake.sub(
-            lambda match: (
-                match.group(0)
-                if match.group(0).startswith("<")
-                else "[ID]"
-            ),
+            lambda match: match.group(0),
             cleaned,
         )
         # Obvious prompt-injection phrases.

@@ -3554,23 +3554,6 @@ def run_conversation(
                 if is_payload_too_large:
                     compression_attempts += 1
                     if compression_attempts > max_compression_attempts:
-                        # Modified by Nous Man — 2026-08-03 — CRITICAL #51:
-                        # before declaring the turn dead, walk the fallback
-                        # chain. A 413 is often provider-specific (tier TPM
-                        # ceiling, small effective window); the next entry
-                        # may take the same payload fine. Mirrors the
-                        # rate-limit failover above (same counter resets).
-                        if agent._try_activate_fallback(reason=classified.reason):
-                            agent._buffer_status(
-                                "⚠️ Payload too large and compression exhausted — "
-                                "switching to fallback provider..."
-                            )
-                            active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt)
-                            retry_count = 0
-                            compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
-                            continue
                         # Terminal — surface the buffered retry trace.
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
@@ -3624,28 +3607,6 @@ def run_conversation(
                                 "📐 Compression could not reduce the request further — "
                                 "removed retained vision payloads and retrying..."
                             )
-                            continue
-
-                        # Modified by Nous Man — 2026-08-03 — CRITICAL #51:
-                        # compression made no progress (e.g. a fresh session
-                        # whose single large request exceeds a provider's
-                        # TPM/request ceiling). Previously this was an
-                        # immediate terminal RuntimeError and the remaining
-                        # ~20 fallback entries were NEVER tried (Discord
-                        # incident 2026-08-02 23:17). Walk the fallback chain
-                        # first — the next provider may accept the identical
-                        # payload. Only when the chain is exhausted (returns
-                        # False) is the turn truly dead.
-                        if agent._try_activate_fallback(reason=classified.reason):
-                            agent._buffer_status(
-                                "⚠️ Payload too large and cannot compress further — "
-                                "switching to fallback provider..."
-                            )
-                            active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt)
-                            retry_count = 0
-                            compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
                             continue
 
                         # Terminal — surface buffered context so the user

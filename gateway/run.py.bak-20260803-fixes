@@ -683,18 +683,6 @@ def _sanitize_gateway_final_response(platform: Any, text: str, chat_type: "str |
         return ""
     if (
         _gateway_platform_value(platform) == "discord"
-        # ponytail: 2026-08-03 — DM exemption per owner directive 14:10/14:13:
-        # "Terminal outputs/progress are OK in DM (not in server channels).
-        # Remember this." The DISCORD-020 thought-leak guard suppressed three
-        # substantive owner-DM replies on 2026-08-03 (~12:07/13:02/14:01,
-        # logs/discord-output-guard.jsonl) after misclassifying status/progress
-        # content as internal-jargon. DMs to the operator are a private,
-        # trusted surface (DISCORD-018/019 already treat owner-DM as
-        # unrestricted), so skip narration suppression when chat_type == "dm".
-        # None/unknown chat_type still suppresses (fail-closed); server
-        # channels and threads keep full guarding. Secret redaction above is
-        # unchanged and still runs on every surface.
-        and chat_type != "dm"
         and _looks_like_internal_narration(redacted)
     ):
         # Modified by Nous Man — 2026-08-02 — DISCORD-020 diagnostics:

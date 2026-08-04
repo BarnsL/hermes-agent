@@ -3015,42 +3015,19 @@ def run_conversation(
                     _retry.thinking_sig_retry_attempted = True
                     _api_stripped = 0
                     for _m in api_messages:
-                        if isinstance(_m, dict):
-                            # Strip Hermes-style reasoning_details
-                            if "reasoning_details" in _m:
-                                _m.pop("reasoning_details", None)
-                                _api_stripped += 1
-                            # Strip ordered Anthropic blocks (interleaved
-                            # thinking + tool_use) which still carry signed
-                            # thinking blocks.
-                            if "anthropic_content_blocks" in _m:
-                                _m.pop("anthropic_content_blocks", None)
-                                _api_stripped += 1
-                            # Strip any stray thinking/redacted_thinking blocks
-                            # already present in a content list.
-                            _content = _m.get("content")
-                            if isinstance(_content, list):
-                                _filtered = []
-                                for _block in _content:
-                                    if isinstance(_block, dict) and _block.get("type") in (
-                                        "thinking",
-                                        "redacted_thinking",
-                                    ):
-                                        _api_stripped += 1
-                                        continue
-                                    _filtered.append(_block)
-                                _m["content"] = _filtered
+                        if isinstance(_m, dict) and "reasoning_details" in _m:
+                            _m.pop("reasoning_details", None)
+                            _api_stripped += 1
                     agent._vprint(
                         f"{agent.log_prefix}⚠️  Thinking block signature invalid, "
-                        f"stripped all reasoning/thinking blocks from api_messages for retry...",
+                        f"stripped reasoning_details from api_messages for retry...",
                         force=True,
                     )
                     logger.warning(
                         "%sThinking block signature recovery: stripped "
-                        "reasoning_details, anthropic_content_blocks and any "
-                        "content-list thinking blocks from api_messages "
+                        "reasoning_details from %d api_messages "
                         "(canonical messages unchanged)",
-                        agent.log_prefix,
+                        agent.log_prefix, _api_stripped,
                     )
                     continue
 
@@ -3554,23 +3531,6 @@ def run_conversation(
                 if is_payload_too_large:
                     compression_attempts += 1
                     if compression_attempts > max_compression_attempts:
-                        # Modified by Nous Man — 2026-08-03 — CRITICAL #51:
-                        # before declaring the turn dead, walk the fallback
-                        # chain. A 413 is often provider-specific (tier TPM
-                        # ceiling, small effective window); the next entry
-                        # may take the same payload fine. Mirrors the
-                        # rate-limit failover above (same counter resets).
-                        if agent._try_activate_fallback(reason=classified.reason):
-                            agent._buffer_status(
-                                "⚠️ Payload too large and compression exhausted — "
-                                "switching to fallback provider..."
-                            )
-                            active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt)
-                            retry_count = 0
-                            compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
-                            continue
                         # Terminal — surface the buffered retry trace.
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
@@ -3624,28 +3584,6 @@ def run_conversation(
                                 "📐 Compression could not reduce the request further — "
                                 "removed retained vision payloads and retrying..."
                             )
-                            continue
-
-                        # Modified by Nous Man — 2026-08-03 — CRITICAL #51:
-                        # compression made no progress (e.g. a fresh session
-                        # whose single large request exceeds a provider's
-                        # TPM/request ceiling). Previously this was an
-                        # immediate terminal RuntimeError and the remaining
-                        # ~20 fallback entries were NEVER tried (Discord
-                        # incident 2026-08-02 23:17). Walk the fallback chain
-                        # first — the next provider may accept the identical
-                        # payload. Only when the chain is exhausted (returns
-                        # False) is the turn truly dead.
-                        if agent._try_activate_fallback(reason=classified.reason):
-                            agent._buffer_status(
-                                "⚠️ Payload too large and cannot compress further — "
-                                "switching to fallback provider..."
-                            )
-                            active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt)
-                            retry_count = 0
-                            compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
                             continue
 
                         # Terminal — surface buffered context so the user
@@ -3982,16 +3920,7 @@ def run_conversation(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    # Pass the classified reason (as the rate-limit failover at
-                    # ~3385 and the auth failover at ~3418 already do). Without
-                    # it this terminal path handed try_activate_fallback()
-                    # reason=None, so it could not tell a provider-quota
-                    # exhaustion (FailoverReason.billing — e.g. Anthropic's
-                    # subscription-lane HTTP 400 "You're out of extra usage")
-                    # apart from a genuinely malformed request, and skipped the
-                    # per-reason cooldown bookkeeping that arms
-                    # _rate_limited_until for the provider being abandoned.
-                    if agent._try_activate_fallback(reason=classified.reason):
+                    if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4166,17 +4095,6 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
-                        # Mirror the retries-exhausted return below, which has
-                        # always carried this. A provider-quota wall can arrive
-                        # as a NON-retryable error (Anthropic's subscription
-                        # lane answers HTTP 400 "You're out of extra usage" with
-                        # retryable=False), so without this key the single most
-                        # important failure class exited through the one path
-                        # that reported no reason at all — leaving callers to
-                        # re-guess it from the message text. cli.py's kanban
-                        # worker keys its rate_limit/billing exit codes off
-                        # this, and the gateway uses it to pick user-facing copy.
-                        "failure_reason": classified.reason.value,
                     }
 
                 if retry_count >= max_retries:

@@ -73,6 +73,16 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("deepseek-reasoner", 600),
     ("deepseek-v4-flash", 600),
     ("deepseek-v4-pro", 600),
+    # Z.AI / Zhipu GLM-4.5-and-later reasoning models. GLM-5.2 ships
+    # with thinking ON by default and routinely pauses minutes before
+    # the first content token — the default 180s stale detector kills
+    # the stream mid-think, surfacing as "GLM hangs without doing
+    # anything". Floor the stale detector so thinking completes. (#17)
+    ("glm-5.2", 300),
+    ("glm-5p2", 300),  # Fireworks alias
+    ("glm-5", 240),
+    ("glm-4.6", 180),
+    ("glm-4.5", 180),
     # Qwen — QwQ reasoning + Qwen3 thinking variants.  QwQ-32B
     # preview is the stable slug; ``qwen3`` covers the family of
     # thinking-mode Qwen3 models (qwen3-235b-a22b, qwen3-32b, etc.)
