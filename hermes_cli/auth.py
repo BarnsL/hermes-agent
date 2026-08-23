@@ -2088,7 +2088,6 @@ def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[st
     this — env values come from the trusted OS user, not from the
     network, and the override is documented for staging/dev use.
 
-    Co-authored-by: memosr <mehmet.sr35@gmail.com>
     """
     if not isinstance(url, str):
         return None

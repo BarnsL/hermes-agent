@@ -1858,7 +1858,7 @@ def _setup_bluebubbles():
 
     print()
     print_info("🔒 Security: Restrict who can message your bot")
-    print_info("   Use iMessage addresses: email (user@icloud.com) or phone (+15551234567)")
+    print_info("   Use an email address or phone (+15551234567)")
     print()
     allowed_users = prompt("Allowed iMessage addresses (comma-separated, leave empty for open access)")
     if allowed_users:

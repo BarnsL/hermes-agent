@@ -10,9 +10,7 @@ when it is covered by a game; no focus change, no clicks).
 Wire protocol (learned live 2026-07-19, jsonrpc 2.0 over WS):
   - endpoint: ``ws://127.0.0.1:<port>/api/ws?token=<HERMES_DASHBOARD_SESSION_TOKEN>``
     * port: last ``HERMES_BACKEND_READY port=N`` line in logs/desktop.log
-    * token: env ``HERMES_DASHBOARD_SESSION_TOKEN`` (set in ~/.hermes/.env;
-      canonical copy in D:/secrets/hermes-serve-token.txt) — web_server.py
-      line ~280 uses it verbatim instead of minting a per-boot random token.
+    * token: read from the live backend process or supplied explicitly.
   - requests:  {"id": N, "method": "...", "params": {...}}
   - replies:   {"jsonrpc":"2.0","id":N,"result":{...}} / {"error":{...}}
   - events:    {"jsonrpc":"2.0","method":"event","params":{"type": T,
@@ -43,9 +41,10 @@ from pathlib import Path
 
 import aiohttp
 
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", r"C:\Users\Burgboy\AppData\Local\hermes"))
+from hermes_constants import get_hermes_home
+
+HERMES_HOME = get_hermes_home()
 DESKTOP_LOG = HERMES_HOME / "logs" / "desktop.log"
-TOKEN_FILE = Path(r"D:\secrets\hermes-serve-token.txt")
 
 
 def discover_port() -> int:
@@ -131,8 +130,7 @@ def _find_backend_pid() -> int:
 
 
 def discover_token() -> str:
-    """Token priority: live backend's process env (always correct) ->
-    explicit env var -> D:/secrets file (only valid for self-spawned serves)."""
+    """Token priority: live backend process, explicit env, explicit file."""
     pid = _find_backend_pid()
     if pid:
         tok = _read_process_env_token(pid)
@@ -140,10 +138,13 @@ def discover_token() -> str:
             print(f"[e2e] token read from live backend pid={pid}")
             return tok
     tok = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "").strip()
-    if not tok and TOKEN_FILE.exists():
-        tok = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    token_file = os.environ.get("HERMES_E2E_TOKEN_FILE", "").strip()
+    if not tok and token_file:
+        token_path = Path(token_file)
+        if token_path.is_file():
+            tok = token_path.read_text(encoding="utf-8").strip()
     if not tok:
-        raise SystemExit("no token: no live backend to read from, no env, no secrets file")
+        raise SystemExit("no token: no live backend, explicit env, or explicit token file")
     return tok
 
 
